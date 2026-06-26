@@ -1,4 +1,4 @@
-# VolGuard
+# VolGuard - Sony NW-A306 volume fix
 
 Auto-dismisses Sony Walkman's "Check volume level" dialog and restores the music
 volume it lowers — on NW-A300-series players, without root.
