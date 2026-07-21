@@ -30,11 +30,19 @@ disable hook is a signature-protected internal API).
 A tiny accessibility service, scoped to **only** the `com.sony.walkman.VolumeCtrlAlert`
 dialog. When that dialog appears it:
 
-1. waits out Sony's delayed-OK button (the OK button is disabled for a few seconds),
-2. taps OK,
-3. restores the music volume the dialog dropped (to your pre-drop level, or max).
+1. immediately sends Sony’s accept broadcast (`AVC_CHECK_LEVEL_OK`) so the audio
+   engine clears the safe-volume gate without waiting for the OK button,
+2. restores the music volume the dialog dropped (to your pre-drop level, or max),
+3. waits out Sony’s delayed OK button (the control is `View.GONE` for ~3 seconds),
+   then taps OK to dismiss the dialog UI.
 
-It needs no internet permission and watches no other app.
+You may still see the dialog on screen for those few seconds; the volume dip should
+be much shorter than waiting for OK before restoring. Completely removing the
+dialog still needs root.
+
+It needs no internet permission and watches no other app. It declares Sony’s
+normal `PERM_MASTER_VOLUME` only so it can send the accept broadcast the stock
+OK button would send.
 
 ## Compatibility
 
