@@ -69,9 +69,12 @@ public class VolGuardService extends AccessibilityService {
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private volatile boolean alertActive = false;
-    // Intended Walkman master volume (0–120), two-slot history.
+    // Latest user-intended Walkman master volume (0–120), updated on normal changes.
     private int desiredMaster = -1;
     private int prevMaster = -1;
+    // Explicit snapshot of master volume immediately before Sony's forced clamp.
+    // This is the only target we restore to when the dialog appears.
+    private int preClampMaster = -1;
 
     private IBinder masterBinder;
     private boolean masterBound = false;
@@ -109,9 +112,11 @@ public class VolGuardService extends AccessibilityService {
                 if (val < 0) return;
                 if (alertActive) return;
                 // Sony clamps with a large step to ~default before the dialog shows.
+                // Remember the pre-clamp level and do not overwrite desiredMaster with the floor.
                 if (desiredMaster >= 0 && desiredMaster - val >= CLAMP_DROP_MIN) {
-                    Log.i(TAG, "ignoring clamp drop " + desiredMaster + "->" + val
-                            + " (keeping desired)");
+                    preClampMaster = desiredMaster;
+                    Log.i(TAG, "clamp detected: preClamp=" + preClampMaster
+                            + " loweredTo=" + val);
                     return;
                 }
                 prevMaster = (desiredMaster >= 0) ? desiredMaster : val;
@@ -156,9 +161,11 @@ public class VolGuardService extends AccessibilityService {
         if (pkg == null || !ALERT_PKG.contentEquals(pkg)) return;
         if (alertActive) return;
         alertActive = true;
-        final int target = chooseTarget();
-        Log.i(TAG, "alert appeared; target master volume=" + target
-                + " (desired=" + desiredMaster + " prev=" + prevMaster + ")");
+        final int target = choosePreClampTarget();
+        Log.i(TAG, "alert appeared; restore target=" + target
+                + " (preClamp=" + preClampMaster
+                + " desired=" + desiredMaster
+                + " prev=" + prevMaster + ")");
         acceptSafeVolume();
         handler.postDelayed(new Runnable() {
             @Override public void run() { restoreMasterVolume(target, 0); }
@@ -167,19 +174,28 @@ public class VolGuardService extends AccessibilityService {
     }
 
     /**
-     * Prefer remembered pre-clamp master level; fall back to previous sample, else max.
+     * Volume to restore: the master level in effect immediately before Sony
+     * lowered it. Never the post-clamp floor. Max only if we have no history.
      */
-    private int chooseTarget() {
+    private int choosePreClampTarget() {
         int max = binderGetMaxVolume();
         if (max <= 0) max = DEFAULT_MASTER_MAX;
         int cur = binderGetMasterVolume();
-        int t = desiredMaster;
-        if (t < 0) t = prevMaster;
-        // If both history slots look like the clamp floor, aim for max.
-        if (t >= 0 && cur >= 0 && t <= cur) {
-            if (prevMaster > t) t = prevMaster;
+
+        int t = -1;
+        if (preClampMaster >= 0) {
+            t = preClampMaster;
+        } else if (desiredMaster >= 0 && (cur < 0 || desiredMaster > cur)) {
+            // desired still holds pre-drop if clamp broadcast was missed.
+            t = desiredMaster;
+        } else if (prevMaster >= 0 && (cur < 0 || prevMaster > cur)) {
+            t = prevMaster;
         }
-        if (t < 0 || (cur >= 0 && t <= cur)) t = max;
+
+        if (t < 0) {
+            Log.w(TAG, "no pre-clamp level known; falling back to max " + max);
+            t = max;
+        }
         return Math.min(Math.max(t, 0), max);
     }
 
@@ -256,6 +272,7 @@ public class VolGuardService extends AccessibilityService {
             if (status == STATUS_SUCCESS) {
                 desiredMaster = t;
                 prevMaster = t;
+                preClampMaster = -1; // consumed
             } else if (status == STATUS_SAFE_VOLUME && attempt < RESTORE_MAX_ATTEMPTS) {
                 handler.postDelayed(new Runnable() {
                     @Override public void run() {

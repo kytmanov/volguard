@@ -33,7 +33,8 @@ dialog. When that dialog appears it:
 1. immediately sends Sony’s accept broadcast (`AVC_CHECK_LEVEL_OK`) so the audio
    engine clears the safe-volume gate without waiting for the OK button,
 2. restores **Walkman master volume** (0–120, via Sony’s `MasterVolumeService`) to
-   the level you had before the clamp — not only Android’s `STREAM_MUSIC` stream,
+   **exactly the level you had before Sony lowered it** (tracked from volume
+   changes; large forced drops are treated as clamps and ignored for the target),
 3. waits out Sony’s delayed OK button (the control is `View.GONE` for ~3 seconds),
    then taps OK to dismiss the dialog UI.
 
