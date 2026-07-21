@@ -22,7 +22,7 @@ rm -rf "$OUT"; mkdir -p "$OUT/classes"
 "$AAPT2" compile --dir res -o "$OUT/compiled.zip"
 "$AAPT2" link -o "$OUT/base.apk" -I "$PLATFORM" \
   --manifest AndroidManifest.xml --java "$OUT/gen" \
-  --min-sdk-version 26 --target-sdk-version 34 --version-code 3 --version-name 1.2.0 \
+  --min-sdk-version 26 --target-sdk-version 34 --version-code 4 --version-name 1.3.0 \
   "$OUT/compiled.zip"
 
 # 2) compile java against android.jar

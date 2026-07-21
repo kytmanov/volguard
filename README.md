@@ -3,7 +3,7 @@
 Tiny accessibility service for Sony NW-A300 series. When the EU "Check volume level"
 dialog shows up, it dismisses it and puts master volume back where it was.
 
-No root. [v1.2.0](../../releases/tag/v1.2.0)
+No root. [v1.3.0](../../releases/tag/v1.3.0)
 
 ## Disclaimer
 
@@ -19,32 +19,38 @@ root you can't remove it, only work around it.
 
 ## What it does
 
-Watches only `com.sony.walkman.VolumeCtrlAlert`. On appear:
+Registers on `IzmAudioManager`'s event listener, so it learns about the clamp the
+moment Sony makes it rather than waiting for the dialog to draw. On a clamp:
 
-1. Sends the same accept broadcast as the OK button (`AVC_CHECK_LEVEL_OK`)
-2. Restores master volume (0–120) to the level from before the drop
-3. Taps OK once Sony enables the button (~3s) so the dialog goes away
+1. Waits for `VolumeCtrlPanel` to raise its safe-volume flag, so accepting can't
+   race ahead of it and leave the flag stuck (which would floor the volume)
+2. Sends the same accept broadcast as the OK button (`AVC_CHECK_LEVEL_OK`), as a
+   foreground broadcast — on the normal queue it sat for ~500ms
+3. Restores master volume (0–120) to the level from before the drop
+4. Taps OK so the dialog goes away without re-launching itself
 
-You'll still see the dialog briefly. Volume comes back in about 1.3–1.4s on my
-A306. Fully removing the dialog needs root.
+The dialog still appears — removing it needs root. But volume is back before it
+finishes drawing, so in practice you see the dialog, not the volume drop.
 
-## Timing (A306, v1.2.0)
+## Timing (A306, v1.3.0)
 
-Five real clamps, hands-off after trigger. Time is from Sony's clamp until master
-volume is back at the pre-drop level:
+Four real clamps, hands-off after trigger. Time is from Sony's clamp
+(`requestSafeVolumeConfirm`) until master volume is back at the pre-drop level:
 
 | # | Before | Dropped to | Restored | ms |
 |--:|-------:|-----------:|---------:|---:|
-| 1 | 80 | 50 | 80 | 1368 |
-| 2 | 80 | 50 | 80 | 1357 |
-| 3 | 80 | 50 | 80 | 1418 |
-| 4 | 80 | 50 | 80 | 1403 |
-| 5 | 80 | 50 | 80 | 1358 |
+| 1 | 80 | 50 | 80 | 137 |
+| 2 | 80 | 50 | 80 | 168 |
+| 3 | 80 | 50 | 80 | 161 |
+| 4 | 80 | 50 | 80 | 135 |
 
-min / median / max: **1357 / 1368 / 1418 ms**
+min / median / max: **135 / 149 / 168 ms** (v1.2.0 was 1357 / 1368 / 1418)
 
-First-time safe volume often trips around ~80 on this unit, not 120. Restore
-target is whatever you had before the drop.
+For reference the dialog itself reports `Displayed +820ms`, so the volume is back
+roughly 700ms before it is on screen.
+
+Safe volume trips at master 80 on this unit, not 120. Restore target is whatever
+you had before the drop.
 
 ## Install
 
