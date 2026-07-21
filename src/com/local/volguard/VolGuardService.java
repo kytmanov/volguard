@@ -14,14 +14,21 @@ import android.view.accessibility.AccessibilityNodeInfo;
 
 /**
  * Watches only Sony's "Check volume level" dialog
- * (com.sony.walkman.VolumeCtrlAlert). When it appears, it waits out Sony's
- * delayed-OK button, taps OK, then restores the music volume the dialog forced
- * down to ~50%. Fully autonomous; no recurring user action.
+ * (com.sony.walkman.VolumeCtrlAlert). When it appears it:
+ * 1) immediately sends AVC_CHECK_LEVEL_OK (same signal as tapping OK) so
+ *    IzmAudioManager.disableSafeVolume() runs without waiting,
+ * 2) restores STREAM_MUSIC early (volume was forced down to ~default),
+ * 3) waits out Sony's ~3s GONE→VISIBLE OK button and taps it to clear the UI.
  */
 public class VolGuardService extends AccessibilityService {
 
     private static final String TAG = "VolGuard";
     private static final String ALERT_PKG = "com.sony.walkman.VolumeCtrlAlert";
+
+    private static final String ACTION_CHECK_LEVEL_OK =
+            "com.sony.walkman.VolumeCtrlAlert.AVC_CHECK_LEVEL_OK";
+    private static final String PERM_MASTER_VOLUME =
+            "com.sony.walkman.volumectrlpanel.PERM_MASTER_VOLUME";
 
     // Broadcast + extras for stream-volume changes (stable framework constants).
     private static final String VOLUME_CHANGED = "android.media.VOLUME_CHANGED_ACTION";
@@ -30,7 +37,8 @@ public class VolGuardService extends AccessibilityService {
 
     private static final int POLL_MS = 200;     // how often to look for the OK button
     private static final int MAX_POLLS = 60;     // ~12s ceiling (Sony delays OK a few s)
-    private static final int RESTORE_DELAY_MS = 350;
+    private static final int EARLY_RESTORE_DELAY_MS = 100;
+    private static final int RESTORE_DELAY_MS = 350; // after OK click, settle then restore
     private static final int REARM_DELAY_MS = 600;
 
     private AudioManager audio;
@@ -73,8 +81,12 @@ public class VolGuardService extends AccessibilityService {
         if (pkg == null || !ALERT_PKG.contentEquals(pkg)) return;
         if (alertActive) return; // already handling this dialog
         alertActive = true;
-        int target = chooseTarget();
+        final int target = chooseTarget();
         Log.i(TAG, "alert appeared; target volume=" + target);
+        acceptSafeVolume();
+        handler.postDelayed(new Runnable() {
+            @Override public void run() { restoreVolume(target); }
+        }, EARLY_RESTORE_DELAY_MS);
         tryClickOk(0, target);
     }
 
@@ -99,13 +111,17 @@ public class VolGuardService extends AccessibilityService {
         if (clicked) {
             Log.i(TAG, "OK clicked (attempt " + attempt + ")");
             handler.postDelayed(new Runnable() {
-                @Override public void run() { restoreVolume(target); }
+                @Override public void run() {
+                    restoreVolume(target); // idempotent; covers late drops
+                    finishHandling();
+                }
             }, RESTORE_DELAY_MS);
             return;
         }
         if (attempt >= MAX_POLLS) {
             Log.w(TAG, "OK button never became clickable; restoring volume anyway");
             restoreVolume(target);
+            finishHandling();
             return;
         }
         handler.postDelayed(new Runnable() {
@@ -132,6 +148,21 @@ public class VolGuardService extends AccessibilityService {
         return false;
     }
 
+    /**
+     * Mirrors VolumeCtrlAlertActivity's OK path: notify the volume panel so it
+     * calls IzmAudioManager.disableSafeVolume() and clears mSafeVolumeAlertFlag.
+     * Does not dismiss the dialog UI (OK stays GONE for ~3s).
+     */
+    private void acceptSafeVolume() {
+        try {
+            Intent i = new Intent(ACTION_CHECK_LEVEL_OK);
+            sendBroadcast(i, PERM_MASTER_VOLUME);
+            Log.i(TAG, "sent " + ACTION_CHECK_LEVEL_OK);
+        } catch (Exception e) {
+            Log.e(TAG, "accept broadcast failed", e);
+        }
+    }
+
     private void restoreVolume(int target) {
         try {
             int max = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
@@ -142,12 +173,13 @@ public class VolGuardService extends AccessibilityService {
             Log.i(TAG, "restored music volume to " + t + "/" + max);
         } catch (Exception e) {
             Log.e(TAG, "restore failed", e);
-        } finally {
-            // Re-arm only after the forced-drop event has surely passed.
-            handler.postDelayed(new Runnable() {
-                @Override public void run() { alertActive = false; }
-            }, REARM_DELAY_MS);
         }
+    }
+
+    private void finishHandling() {
+        handler.postDelayed(new Runnable() {
+            @Override public void run() { alertActive = false; }
+        }, REARM_DELAY_MS);
     }
 
     @Override public void onInterrupt() { }
