@@ -26,7 +26,9 @@ public class MainActivity extends Activity {
 
         TextView tv = new TextView(this);
         tv.setText("VolGuard auto-dismisses Sony's \"Check volume level\" dialog "
-                + "and restores the music volume it lowers.\n\n"
+                + "and restores Walkman master volume to your pre-clamp level.\n\n"
+                + "It accepts the safe-volume gate immediately, restores volume via "
+                + "Sony's volume service, then taps OK once the button appears.\n\n"
                 + "If it ever stops working, enable VolGuard below under Accessibility.");
         root.addView(tv);
 
