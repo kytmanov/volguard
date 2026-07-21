@@ -32,17 +32,18 @@ dialog. When that dialog appears it:
 
 1. immediately sends Sony’s accept broadcast (`AVC_CHECK_LEVEL_OK`) so the audio
    engine clears the safe-volume gate without waiting for the OK button,
-2. restores the music volume the dialog dropped (to your pre-drop level, or max),
+2. restores **Walkman master volume** (0–120, via Sony’s `MasterVolumeService`) to
+   the level you had before the clamp — not only Android’s `STREAM_MUSIC` stream,
 3. waits out Sony’s delayed OK button (the control is `View.GONE` for ~3 seconds),
    then taps OK to dismiss the dialog UI.
 
-You may still see the dialog on screen for those few seconds; the volume dip should
-be much shorter than waiting for OK before restoring. Completely removing the
-dialog still needs root.
+You may still see the dialog on screen briefly; master volume is restored as soon
+as the panel accepts the broadcast (typically ~1s). Completely removing the dialog
+still needs root.
 
 It needs no internet permission and watches no other app. It declares Sony’s
-normal `PERM_MASTER_VOLUME` only so it can send the accept broadcast the stock
-OK button would send.
+normal `PERM_MASTER_VOLUME` so it can send the accept broadcast and talk to the
+volume panel service.
 
 ## Compatibility
 
