@@ -1,90 +1,54 @@
-# VolGuard - Sony NW-A306 volume fix
+# VolGuard
 
-Auto-dismisses Sony Walkman's "Check volume level" dialog and restores **Walkman
-master volume** to the level you had **before** Sony lowered it — on NW-A300-series
-players, without root.
+Tiny accessibility service for Sony NW-A300 series. When the EU "Check volume level"
+dialog shows up, it dismisses it and puts master volume back where it was.
 
-**Current release: [v1.2.0](../../releases/tag/v1.2.0)**
+No root. [v1.2.0](../../releases/tag/v1.2.0)
 
-## ⚠️ Disclaimer — use at your own risk
+## Disclaimer
 
-**By installing and running VolGuard you accept all risk.** It is provided "AS IS",
-with no warranty of any kind. The author is **NOT responsible for anything** that
-results from its use — including hearing damage, device malfunction, data loss, or
-any other harm. If you do not accept this, do not install it.
+Use at your own risk. No warranty. Loud volume can damage hearing. Not affiliated
+with Sony.
 
-VolGuard auto-dismisses a volume-safety confirmation. **Prolonged high-volume
-listening can permanently damage your hearing.**
+## Problem
 
-Not affiliated with or endorsed by Sony. "Walkman" and model names are trademarks
-of Sony, used only to describe compatibility.
+On EU firmware, past a certain volume Sony shows a confirmation dialog and drops
+master volume (usually to ~50). You have to wait for OK, tap it, then crank the
+volume back up. Every time. The check is baked into Sony's volume stack; without
+root you can't remove it, only work around it.
 
-## The problem
+## What it does
 
-On Sony NW-A300-series players (EU firmware), raising volume past a threshold
-triggers a "Check volume level" dialog that you must acknowledge. The dialog also
-drops media volume to ~50% each time. The gate is built into Sony's volume panel
-and audio engine; it **cannot be removed without root** (its state lives in the
-engine's private storage, thresholds are read-only system properties, and the
-disable hook is a signature-protected internal API).
+Watches only `com.sony.walkman.VolumeCtrlAlert`. On appear:
 
-## What VolGuard does
+1. Sends the same accept broadcast as the OK button (`AVC_CHECK_LEVEL_OK`)
+2. Restores master volume (0–120) to the level from before the drop
+3. Taps OK once Sony enables the button (~3s) so the dialog goes away
 
-A tiny accessibility service, scoped to **only** the `com.sony.walkman.VolumeCtrlAlert`
-dialog. When that dialog appears it:
+You'll still see the dialog briefly. Volume comes back in about 1.3–1.4s on my
+A306. Fully removing the dialog needs root.
 
-1. immediately sends Sony’s accept broadcast (`AVC_CHECK_LEVEL_OK`) so the audio
-   engine clears the safe-volume gate without waiting for the OK button,
-2. restores **Walkman master volume** (0–120, via Sony’s `MasterVolumeService`) to
-   **exactly the level you had before Sony lowered it** (tracked from volume
-   changes; large forced drops are treated as clamps and ignored for the target),
-3. waits out Sony’s delayed OK button (the control is `View.GONE` for ~3 seconds),
-   then taps OK to dismiss the dialog UI.
+## Timing (A306, v1.2.0)
 
-You may still see the dialog on screen briefly; master volume is restored as soon
-as the panel accepts the broadcast (typically ~1.3–1.4 s). Completely removing the
-dialog still needs root.
+Five real clamps, hands-off after trigger. Time is from Sony's clamp until master
+volume is back at the pre-drop level:
 
-It needs no internet permission and watches no other app. It declares Sony’s
-normal `PERM_MASTER_VOLUME` so it can send the accept broadcast and talk to the
-volume panel service.
+| # | Before | Dropped to | Restored | ms |
+|--:|-------:|-----------:|---------:|---:|
+| 1 | 80 | 50 | 80 | 1368 |
+| 2 | 80 | 50 | 80 | 1357 |
+| 3 | 80 | 50 | 80 | 1418 |
+| 4 | 80 | 50 | 80 | 1403 |
+| 5 | 80 | 50 | 80 | 1358 |
 
-## Measurements (v1.2.0)
+min / median / max: **1357 / 1368 / 1418 ms**
 
-Measured on a **Sony NW-A306** (EU firmware, Android 14) with VolGuard **1.2.0**.
-Each trial re-armed Sony’s first-time safe-volume state, raised volume until the
-real clamp + dialog, then left the device hands-off.
+First-time safe volume often trips around ~80 on this unit, not 120. Restore
+target is whatever you had before the drop.
 
-**Metric:** wall-clock from Sony’s clamp (`requestSafeVolumeConfirm`) until
-`setMasterVolume` succeeds at the **pre-clamp** master level (not a fixed 120).
+## Install
 
-| Trial | Pre-clamp | Sony lowered to | Restored to | Time to restore |
-|------:|----------:|----------------:|------------:|----------------:|
-| 1 | 80 | 50 | 80 | **1368 ms** |
-| 2 | 80 | 50 | 80 | **1357 ms** |
-| 3 | 80 | 50 | 80 | **1418 ms** |
-| 4 | 80 | 50 | 80 | **1403 ms** |
-| 5 | 80 | 50 | 80 | **1358 ms** |
-
-| | |
-|--|--|
-| Match (pre-clamp = restored) | **5 / 5** |
-| Min | **1357 ms** (~1.36 s) |
-| Median | **1368 ms** (~1.37 s) |
-| Max | **1418 ms** (~1.42 s) |
-
-On first-time safe-volume, the clamp often trips around master level **~80** on this
-device (threshold path), not always 120. VolGuard restores that pre-clamp value,
-whatever it was.
-
-## Compatibility
-
-- Sony NW-A306 / NW-A300 series, Android 14 (API 34).
-- Non-root.
-
-## Install (prebuilt APK)
-
-Download `volguard.apk` from [Releases](../../releases), then:
+Grab `volguard.apk` from [Releases](../../releases):
 
 ```sh
 adb install volguard.apk
@@ -92,20 +56,16 @@ adb shell settings put secure enabled_accessibility_services com.local.volguard/
 adb shell settings put secure accessibility_enabled 1
 ```
 
-(If multiple adb devices are attached, add `-s <serial>` to each command.)
+Or enable **Settings → Accessibility → VolGuard** by hand. Use `-s <serial>` if
+you have more than one adb device.
 
-You can also enable it manually under **Settings → Accessibility → VolGuard**.
+## Build
 
-## Build from source
-
-Requires the Android SDK build-tools (34.0.0) + platform 34, and **JDK 17**
-(newer JDKs crash `d8`). Then:
+Android SDK build-tools 34 + platform 34, **JDK 17** (newer JDKs break `d8`):
 
 ```sh
 ANDROID_HOME=/path/to/android-sdk JAVA_HOME=/path/to/jdk17 bash build.sh
 ```
-
-This produces `volguard.apk` (signed with a generated debug key).
 
 ## License
 
