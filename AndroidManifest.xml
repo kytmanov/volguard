@@ -2,7 +2,6 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.local.volguard">
 
-    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
     <!-- Required to send Sony's accept broadcast (sender must hold this; prot=normal). -->
     <uses-permission android:name="com.sony.walkman.volumectrlpanel.PERM_MASTER_VOLUME"/>
 

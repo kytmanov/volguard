@@ -1,9 +1,9 @@
 # VolGuard
 
-Tiny accessibility service for Sony NW-A300 series. When the EU "Check volume level"
-dialog shows up, it dismisses it and puts master volume back where it was.
+Tiny accessibility service for Sony NW-A300 series. It handles the EU "Check volume
+level" dialog for you and puts the volume back where you had it.
 
-No root. [v1.3.0](../../releases/tag/v1.3.0)
+No root. [v1.3.1](../../releases/tag/v1.3.1)
 
 ## Disclaimer
 
@@ -12,49 +12,40 @@ with Sony.
 
 ## Problem
 
-On EU firmware, past a certain volume Sony shows a confirmation dialog and drops
-master volume (usually to ~50). You have to wait for OK, tap it, then crank the
-volume back up. Every time. The check is baked into Sony's volume stack; without
-root you can't remove it, only work around it.
+On EU firmware, once you pass a certain volume Sony drops the volume to about 50
+and shows a confirmation dialog. The OK button stays greyed out for three seconds.
+You wait, tap OK, then turn the volume back up. Every time.
 
-## What it does
+The check lives inside Sony's own volume stack. Without root you cannot remove it,
+only react to it.
 
-Registers on `IzmAudioManager`'s event listener, so it learns about the clamp the
-moment Sony makes it rather than waiting for the dialog to draw. On a clamp:
+## What you get
 
-1. Waits for `VolumeCtrlPanel` to raise its safe-volume flag, so accepting can't
-   race ahead of it and leave the flag stuck (which would floor the volume)
-2. Sends the same accept broadcast as the OK button (`AVC_CHECK_LEVEL_OK`), as a
-   foreground broadcast — on the normal queue it sat for ~500ms
-3. Restores master volume (0–120) to the level from before the drop
-4. Taps OK so the dialog goes away without re-launching itself
+- The volume comes back on its own, to the exact level you had. If you were at
+  120 you get 120 back, not a default.
+- You do not have to tap anything. The dialog closes itself.
+- The dialog still appears. Removing it needs root. It clears after about three
+  and a half seconds, and the volume is correct long before that.
 
-The dialog still appears — removing it needs root. But volume is back before it
-finishes drawing, so in practice you see the dialog, not the volume drop.
+## How it works
 
-## Timing (A306, v1.3.0)
+VolGuard listens to Sony's audio service directly, so it hears the volume drop as
+it happens instead of waiting for the dialog to show up. It sends the same accept
+signal the OK button sends, writes your old volume back, then taps OK once Sony
+enables the button.
 
-Three real clamps, hands-off after trigger. t=0 is Sony's clamp
-(`requestSafeVolumeConfirm`):
+It only reacts to `com.sony.walkman.VolumeCtrlAlert`, and only ever presses that
+dialog's own OK button.
 
-| # | clamp seen | volume restored | dialog dismissed |
-|--:|-----------:|----------------:|-----------------:|
-| 1 |  13 ms |  139 ms |  3663 ms |
-| 2 |   9 ms |  127 ms |  3573 ms |
-| 3 |   6 ms |  124 ms |  3612 ms |
+## Timing (A306)
 
-Volume is back in **~130ms**; v1.2.0 took 1357-1418 ms. The dialog itself reports
-`Displayed +800ms`, so the level is restored before it is on screen.
+Four real clamps, at levels 80, 85 and 120, timed from Sony's volume drop. The
+volume was back in 44-70 ms, and the dialog closed itself after about 3.5 s.
+v1.2.0 took about 1.4 s to restore.
 
-Dismissal stays at ~3.6s because Sony keeps the OK button `GONE` for a hard-coded
-3000ms after the dialog resumes. Nothing short of root changes that — but by then
-the volume has been correct for three and a half seconds.
+The 3.5 s is Sony's fixed three second delay before the OK button becomes usable.
 
-After the accept, safe volume is INACTIVE: verified taking master 80 -> 120 with
-no clamp and no dialog.
-
-Safe volume trips at master 80 on this unit, not 120. Restore target is whatever
-you had before the drop.
+Safe volume trips at master 80 on this unit, not 120.
 
 ## Install
 

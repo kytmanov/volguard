@@ -7,6 +7,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
+import android.content.SharedPreferences;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.IBinder;
@@ -74,6 +75,9 @@ public class VolGuardService extends AccessibilityService {
     private static final String IZM_LISTENER_IFACE =
             "com.sony.walkman.izmaudiomanager.IIzmAudioManagerEventListener";
     // IIzmAudioManager.Stub transaction codes.
+    private static final int TX_IZM_SET_VOLUME = 3;
+    private static final int TX_IZM_GET_VOLUME = 4;
+    private static final int TX_IZM_DISABLE_SAFE_VOLUME = 10;
     private static final int TX_IZM_REGIST_LISTENER = 86;
     private static final int TX_IZM_UNREGIST_LISTENER = 87;
     // IIzmAudioManagerEventListener.Stub transaction codes (incoming).
@@ -91,6 +95,8 @@ public class VolGuardService extends AccessibilityService {
     private static final int RESTORE_MAX_ATTEMPTS = 60;
     private static final int RESTORE_DELAY_MS = 350;
     private static final int REARM_DELAY_MS = 600;
+    private static final String PREFS = "volguard";
+    private static final String KEY_LAST_MASTER = "last_master";
     /** Sudden drop at least this large is treated as Sony's clamp, not a user action. */
     private static final int CLAMP_DROP_MIN = 15;
     private static final int DEFAULT_MASTER_MAX = 120;
@@ -108,6 +114,10 @@ public class VolGuardService extends AccessibilityService {
     // Explicit snapshot of master volume immediately before Sony's forced clamp.
     // This is the only target we restore to when the dialog appears.
     private int preClampMaster = -1;
+    // Survives process death. Sony can clamp at boot, before this service is even
+    // started, and then nothing in memory remembers the level the user was at.
+    private int lastKnownMaster = -1;
+    private SharedPreferences prefs;
 
     private IBinder masterBinder;
     private boolean masterBound = false;
@@ -173,6 +183,8 @@ public class VolGuardService extends AccessibilityService {
                 if (cur >= 0 && desiredMaster < 0) {
                     desiredMaster = cur;
                     prevMaster = cur;
+                    // Do not persist this one: if Sony already clamped before we
+                    // started, cur is the floor and would overwrite the real level.
                 }
                 Log.i(TAG, "master volume now " + cur + "; desired=" + desiredMaster);
             } catch (Exception e) {
@@ -190,25 +202,43 @@ public class VolGuardService extends AccessibilityService {
     private final BroadcastReceiver volReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
             if (i == null) return;
-            String action = i.getAction();
-            if (ACTION_MASTER_VOLUME_CHANGED.equals(action)) {
+            if (ACTION_MASTER_VOLUME_CHANGED.equals(i.getAction())) {
                 int val = i.getIntExtra(EXTRA_MASTER_VOLUME, -1);
-                if (val < 0) return;
-                if (alertActive) return;
-                // Sony clamps with a large step to ~default before the dialog shows.
-                // Remember the pre-clamp level and do not overwrite desiredMaster with the floor.
-                if (desiredMaster >= 0 && desiredMaster - val >= CLAMP_DROP_MIN) {
-                    preClampMaster = desiredMaster;
-                    Log.i(TAG, "clamp detected: preClamp=" + preClampMaster
-                            + " loweredTo=" + val);
-                    return;
-                }
-                prevMaster = (desiredMaster >= 0) ? desiredMaster : val;
-                desiredMaster = val;
-                return;
+                if (val >= 0) noteMasterVolume(val);
             }
         }
     };
+
+    /**
+     * Track user-intended master and catch Sony's clamp step.
+     *
+     * Even while a trip is active, still record a clamp-shaped drop if preClamp
+     * is unknown — 1.3.0 could miss MASTER_VOLUME_CHANGED when izm-confirm set
+     * alertActive first, then restore to the wrong level.
+     */
+    private void noteMasterVolume(int val) {
+        if (val < 0) return;
+
+        int baseline = desiredMaster >= 0 ? desiredMaster
+                : (prevMaster >= 0 ? prevMaster : lastKnownMaster);
+        boolean clampDrop = baseline >= 0 && baseline - val >= CLAMP_DROP_MIN;
+
+        if (clampDrop) {
+            if (preClampMaster < 0 || baseline > preClampMaster) {
+                preClampMaster = baseline;
+                Log.i(TAG, "clamp detected: preClamp=" + preClampMaster
+                        + " loweredTo=" + val
+                        + " alertActive=" + alertActive);
+            }
+            return; // never learn the floor as desired
+        }
+
+        if (alertActive) return;
+
+        prevMaster = (desiredMaster >= 0) ? desiredMaster : val;
+        desiredMaster = val;
+        rememberMaster(val);
+    }
 
     @Override protected void onServiceConnected() {
         IntentFilter filter = new IntentFilter();
@@ -221,10 +251,14 @@ public class VolGuardService extends AccessibilityService {
             registerReceiver(volReceiver, filter, PERM_MASTER_VOLUME, null);
         }
 
+        prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        lastKnownMaster = prefs.getInt(KEY_LAST_MASTER, -1);
+
         izmListener.attachInterface(null, IZM_LISTENER_IFACE);
         bindMasterService();
         bindIzmService();
-        Log.i(TAG, "connected; desiredMaster=" + desiredMaster);
+        Log.i(TAG, "connected; desiredMaster=" + desiredMaster
+                + " lastKnownMaster=" + lastKnownMaster);
     }
 
     private void bindIzmService() {
@@ -299,10 +333,13 @@ public class VolGuardService extends AccessibilityService {
     /**
      * Begin handling one safe-volume trip. The clamp has already happened by now;
      * what remains is to accept (clearing both SafeVolume ACTIVE and the panel's
-     * flag) and put the master level back.
+     * flag) and put the master level back to the exact pre-clamp master value.
      */
     private void beginTrip(String source) {
         if (alertActive) return;
+        // Snapshot before alertActive blocks normal tracking. Clamp may already
+        // have lowered getMasterVolume(); desired/prev still hold the pre-drop level.
+        capturePreClampIfNeeded();
         alertActive = true;
         restoreDone = false;
         okTapStarted = false;
@@ -311,8 +348,42 @@ public class VolGuardService extends AccessibilityService {
         Log.i(TAG, "trip via " + source + "; restore target=" + restoreTarget
                 + " (preClamp=" + preClampMaster
                 + " desired=" + desiredMaster
-                + " prev=" + prevMaster + ")");
+                + " prev=" + prevMaster
+                + " lastKnown=" + lastKnownMaster + ")");
         gatePoll(0);
+    }
+
+    /** If we have not yet seen a clamp-shaped drop, infer pre-clamp from history. */
+    private void capturePreClampIfNeeded() {
+        if (preClampMaster >= 0) return;
+        int cur = binderGetMasterVolume();
+        if (cur < 0) cur = izmGetVolume();
+        // Most recent wins, not loudest. The pre-clamp level is the last value the
+        // user chose; picking the maximum of the three would restore *above* it —
+        // e.g. a 120 -> 85 slider move leaves prevMaster=120 with desiredMaster=85,
+        // and a clamp at 85 must come back to 85.
+        //
+        // The `> cur` guard is what makes falling through safe: desiredMaster is
+        // seeded from the current level at bind, so it holds the post-clamp floor
+        // when Sony clamped before this process started. A floor never passes the
+        // guard, so selection moves on to the next source.
+        int best = -1;
+        String src = null;
+        if (desiredMaster >= 0 && (cur < 0 || desiredMaster > cur)) {
+            best = desiredMaster;
+            src = "desiredMaster";
+        } else if (prevMaster >= 0 && (cur < 0 || prevMaster > cur)) {
+            best = prevMaster;
+            src = "prevMaster";
+        } else if (lastKnownMaster >= 0 && (cur < 0 || lastKnownMaster > cur)) {
+            best = lastKnownMaster;
+            src = "lastKnownMaster";
+        }
+        if (best >= 0) {
+            preClampMaster = best;
+            Log.i(TAG, "preClamp from " + src + "=" + preClampMaster
+                    + " (cur=" + cur + ")");
+        }
     }
 
     /**
@@ -332,7 +403,15 @@ public class VolGuardService extends AccessibilityService {
         int status;
         try {
             int cur = binderGetMasterVolume();
-            status = binderSetMasterVolume(cur >= 0 ? cur : 0);
+            if (cur < 0) {
+                // The probe is only safe because it rewrites the level already in
+                // effect. Without a reading there is no such value — writing 0 here
+                // would mute the device, and with the flag still down it would reach
+                // Izm and stick. Skip this pass instead.
+                status = STATUS_ERROR;
+            } else {
+                status = binderSetMasterVolume(cur);
+            }
         } catch (Exception e) {
             status = STATUS_ERROR;
         }
@@ -354,29 +433,37 @@ public class VolGuardService extends AccessibilityService {
     }
 
     /**
-     * Volume to restore: the master level in effect immediately before Sony
-     * lowered it. Never the post-clamp floor. Max only if we have no history.
+     * Exact master level from immediately before Sony clamped (e.g. 120 → 120), or
+     * -1 when it cannot be determined. Never the post-clamp floor.
+     *
+     * -1 means "do not touch the volume" and must stay negative all the way to the
+     * caller: clamping it into range would turn an unknown level into 0 and mute the
+     * device, which is the opposite of leaving things alone.
      */
     private int choosePreClampTarget() {
         int max = binderGetMaxVolume();
         if (max <= 0) max = DEFAULT_MASTER_MAX;
-        int cur = binderGetMasterVolume();
+        capturePreClampIfNeeded();
 
-        int t = -1;
-        if (preClampMaster >= 0) {
-            t = preClampMaster;
-        } else if (desiredMaster >= 0 && (cur < 0 || desiredMaster > cur)) {
-            // desired still holds pre-drop if clamp broadcast was missed.
-            t = desiredMaster;
-        } else if (prevMaster >= 0 && (cur < 0 || prevMaster > cur)) {
-            t = prevMaster;
-        }
-
+        int t = preClampMaster;
         if (t < 0) {
-            Log.w(TAG, "no pre-clamp level known; falling back to max " + max);
-            t = max;
+            int cur = binderGetMasterVolume();
+            if (cur < 0) cur = izmGetVolume();
+            if (cur < 0) {
+                Log.w(TAG, "no pre-clamp level and no readable volume; not touching it");
+                return -1;
+            }
+            Log.w(TAG, "no pre-clamp level known; leaving volume at " + cur);
+            t = cur;
         }
         return Math.min(Math.max(t, 0), max);
+    }
+
+    /** Persist the user's level so a clamp before our next start can be undone. */
+    private void rememberMaster(int volume) {
+        if (volume < 0 || volume == lastKnownMaster || prefs == null) return;
+        lastKnownMaster = volume;
+        prefs.edit().putInt(KEY_LAST_MASTER, volume).apply();
     }
 
     /**
@@ -466,6 +553,9 @@ public class VolGuardService extends AccessibilityService {
     }
 
     private void acceptSafeVolume() {
+        // Sync clear of SafeVolume ACTIVE so a restore above threshold cannot
+        // re-clamp while the panel broadcast is still in flight.
+        izmDisableSafeVolume();
         try {
             Intent i = new Intent(ACTION_CHECK_LEVEL_OK);
             // The panel receives this on a background-registered receiver; without
@@ -479,43 +569,53 @@ public class VolGuardService extends AccessibilityService {
     }
 
     /**
-     * Restore Walkman master volume via Sony's panel service. Retries while the
-     * panel still returns STATUS_SAFE_VOLUME (flag not cleared yet). Also nudges
-     * STREAM_MUSIC as a secondary path.
+     * Restore to the exact pre-clamp master level (120 restores to 120, not ~80).
+     *
+     * 1.3.0 stopped on panel status==SUCCESS without checking the resulting level,
+     * so a write that still hit the floor (or a cap) counted as done. We write via
+     * Izm setVolume (true 0–120 path) and only finish when getVolume == target.
      */
     private void restoreMasterVolume(final int target, final int attempt) {
+        if (target < 0) {
+            // Unknown level. Writing anything here would be a guess; 0 would mute.
+            Log.w(TAG, "no restore target; leaving volume untouched");
+            return;
+        }
         int max = binderGetMaxVolume();
         if (max <= 0) max = DEFAULT_MASTER_MAX;
         final int t = Math.min(Math.max(target, 0), max);
         try {
-            int status = binderSetMasterVolume(t);
-            int now = binderGetMasterVolume();
-            Log.i(TAG, "setMasterVolume(" + t + ") status=" + status
-                    + " now=" + now + " attempt=" + attempt);
-            if (status == STATUS_SUCCESS) {
+            if (attempt == 0 || attempt % 4 == 0) izmDisableSafeVolume();
+
+            boolean izmOk = izmSetVolume(t);
+            int nowIzm = izmGetVolume();
+
+            int status = STATUS_ERROR;
+            int nowPanel = -1;
+            try {
+                status = binderSetMasterVolume(t);
+                nowPanel = binderGetMasterVolume();
+            } catch (Exception e) {
+                Log.w(TAG, "panel setMasterVolume failed", e);
+                if (masterBinder == null) bindMasterService();
+            }
+
+            int now = nowIzm >= 0 ? nowIzm : nowPanel;
+            Log.i(TAG, "restore target=" + t
+                    + " izmOk=" + izmOk + " nowIzm=" + nowIzm
+                    + " panelStatus=" + status + " nowPanel=" + nowPanel
+                    + " attempt=" + attempt);
+
+            if (now == t) {
                 desiredMaster = t;
                 prevMaster = t;
-                preClampMaster = -1; // consumed
+                rememberMaster(t);
+                preClampMaster = -1;
                 restoreDone = true;
-                return;
-            } else if (status == STATUS_SAFE_VOLUME && attempt < RESTORE_MAX_ATTEMPTS) {
-                handler.postDelayed(new Runnable() {
-                    @Override public void run() {
-                        restoreMasterVolume(t, attempt + 1);
-                    }
-                }, RESTORE_RETRY_MS);
-                return;
-            } else if (status == STATUS_ERROR && attempt < RESTORE_MAX_ATTEMPTS) {
-                bindMasterService();
-                handler.postDelayed(new Runnable() {
-                    @Override public void run() {
-                        restoreMasterVolume(t, attempt + 1);
-                    }
-                }, RESTORE_RETRY_MS);
+                Log.i(TAG, "restore exact OK: master=" + now);
                 return;
             }
-        } catch (Exception e) {
-            Log.e(TAG, "setMasterVolume failed", e);
+
             if (attempt < RESTORE_MAX_ATTEMPTS) {
                 handler.postDelayed(new Runnable() {
                     @Override public void run() {
@@ -524,10 +624,77 @@ public class VolGuardService extends AccessibilityService {
                 }, RESTORE_RETRY_MS);
                 return;
             }
+            Log.w(TAG, "restore gave up: wanted " + t
+                    + " got izm=" + nowIzm + " panel=" + nowPanel);
+        } catch (Exception e) {
+            Log.e(TAG, "restoreMasterVolume failed", e);
+            if (attempt < RESTORE_MAX_ATTEMPTS) {
+                handler.postDelayed(new Runnable() {
+                    @Override public void run() {
+                        restoreMasterVolume(t, attempt + 1);
+                    }
+                }, RESTORE_RETRY_MS);
+            }
         }
-        // Deliberately no STREAM_MUSIC fallback here. Sony clamps the 0–120 master
-        // level, not STREAM_MUSIC, so raising the stream does not undo the clamp —
-        // it only makes everything permanently louder than the user asked for.
+    }
+
+    private boolean izmDisableSafeVolume() {
+        IBinder b = izmBinder;
+        if (b == null) return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(IZM_IFACE);
+            b.transact(TX_IZM_DISABLE_SAFE_VOLUME, data, reply, 0);
+            reply.readException();
+            Log.i(TAG, "izm disableSafeVolume ok");
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "izm disableSafeVolume failed", e);
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private boolean izmSetVolume(int volume) {
+        IBinder b = izmBinder;
+        if (b == null) return false;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(IZM_IFACE);
+            data.writeInt(volume);
+            b.transact(TX_IZM_SET_VOLUME, data, reply, 0);
+            reply.readException();
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "izm setVolume(" + volume + ") failed", e);
+            return false;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    private int izmGetVolume() {
+        IBinder b = izmBinder;
+        if (b == null) return -1;
+        Parcel data = Parcel.obtain();
+        Parcel reply = Parcel.obtain();
+        try {
+            data.writeInterfaceToken(IZM_IFACE);
+            b.transact(TX_IZM_GET_VOLUME, data, reply, 0);
+            reply.readException();
+            return reply.readInt();
+        } catch (Exception e) {
+            Log.w(TAG, "izm getVolume failed", e);
+            return -1;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
     }
 
     private int binderGetMasterVolume() {
