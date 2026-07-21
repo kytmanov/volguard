@@ -34,20 +34,24 @@ finishes drawing, so in practice you see the dialog, not the volume drop.
 
 ## Timing (A306, v1.3.0)
 
-Four real clamps, hands-off after trigger. Time is from Sony's clamp
-(`requestSafeVolumeConfirm`) until master volume is back at the pre-drop level:
+Three real clamps, hands-off after trigger. t=0 is Sony's clamp
+(`requestSafeVolumeConfirm`):
 
-| # | Before | Dropped to | Restored | ms |
-|--:|-------:|-----------:|---------:|---:|
-| 1 | 80 | 50 | 80 | 137 |
-| 2 | 80 | 50 | 80 | 168 |
-| 3 | 80 | 50 | 80 | 161 |
-| 4 | 80 | 50 | 80 | 135 |
+| # | clamp seen | volume restored | dialog dismissed |
+|--:|-----------:|----------------:|-----------------:|
+| 1 |  13 ms |  139 ms |  3663 ms |
+| 2 |   9 ms |  127 ms |  3573 ms |
+| 3 |   6 ms |  124 ms |  3612 ms |
 
-min / median / max: **135 / 149 / 168 ms** (v1.2.0 was 1357 / 1368 / 1418)
+Volume is back in **~130ms**; v1.2.0 took 1357-1418 ms. The dialog itself reports
+`Displayed +800ms`, so the level is restored before it is on screen.
 
-For reference the dialog itself reports `Displayed +820ms`, so the volume is back
-roughly 700ms before it is on screen.
+Dismissal stays at ~3.6s because Sony keeps the OK button `GONE` for a hard-coded
+3000ms after the dialog resumes. Nothing short of root changes that — but by then
+the volume has been correct for three and a half seconds.
+
+After the accept, safe volume is INACTIVE: verified taking master 80 -> 120 with
+no clamp and no dialog.
 
 Safe volume trips at master 80 on this unit, not 120. Restore target is whatever
 you had before the drop.

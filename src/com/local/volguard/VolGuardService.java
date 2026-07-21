@@ -16,6 +16,7 @@ import android.os.RemoteException;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
 
 /**
  * Undoes Sony's safe-volume clamp as early as the platform allows.
@@ -42,6 +43,8 @@ public class VolGuardService extends AccessibilityService {
 
     private static final String TAG = "VolGuard";
     private static final String ALERT_PKG = "com.sony.walkman.VolumeCtrlAlert";
+    private static final String OK_BUTTON_ID =
+            "com.sony.walkman.VolumeCtrlAlert:id/btn_confirm_check";
 
     private static final String ACTION_CHECK_LEVEL_OK =
             "com.sony.walkman.VolumeCtrlAlert.AVC_CHECK_LEVEL_OK";
@@ -78,8 +81,9 @@ public class VolGuardService extends AccessibilityService {
     private static final int TX_ON_SAFE_VOLUME_CONFIRM_REQUIRED = 3;
     private static final int TX_ON_VOLUME_STATE_CHANGED = 4;
 
-    private static final int POLL_MS = 200;
-    private static final int MAX_POLLS = 60;
+    /** Sony reveals OK ~3s after onResume; poll tightly so the tap is prompt. */
+    private static final int POLL_MS = 100;
+    private static final int MAX_POLLS = 100;
     /** Probe cadence while waiting for the panel to raise mSafeVolumeAlertFlag. */
     private static final int GATE_POLL_MS = 20;
     private static final int GATE_MAX_ATTEMPTS = 50;
@@ -115,6 +119,7 @@ public class VolGuardService extends AccessibilityService {
     private int restoreTarget = -1;
     private volatile boolean restoreDone = false;
     private boolean okTapStarted = false;
+    private boolean alertSeen = false;
 
     /**
      * IIzmAudioManagerEventListener. registListener carries no permission check,
@@ -301,6 +306,7 @@ public class VolGuardService extends AccessibilityService {
         alertActive = true;
         restoreDone = false;
         okTapStarted = false;
+        alertSeen = false;
         restoreTarget = choosePreClampTarget();
         Log.i(TAG, "trip via " + source + "; restore target=" + restoreTarget
                 + " (preClamp=" + preClampMaster
@@ -373,25 +379,34 @@ public class VolGuardService extends AccessibilityService {
         return Math.min(Math.max(t, 0), max);
     }
 
+    /**
+     * Tap the dialog's OK button, then keep watching until the dialog is actually
+     * gone. A successful performAction is not proof of dismissal, and Sony keeps the
+     * button GONE for ~3s after onResume, so the first few passes find nothing.
+     *
+     * getRootInActiveWindow() is not restricted to the packages this service
+     * subscribes to, so the root's package must be checked: without that we would
+     * happily click the first Button in whatever app happens to be foreground.
+     */
     private void tryClickOk(final int attempt, final int target) {
-        boolean clicked = false;
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root != null) {
-            clicked = clickFirstEnabledButton(root);
-            root.recycle();
+        AccessibilityNodeInfo root = findAlertRoot();
+        boolean alertUp = root != null;
+        if (alertUp) {
+            alertSeen = true;
+            if (clickOkButton(root)) Log.i(TAG, "OK clicked (attempt " + attempt + ")");
         }
-        if (clicked) {
-            Log.i(TAG, "OK clicked (attempt " + attempt + ")");
-            handler.postDelayed(new Runnable() {
-                @Override public void run() {
-                    restoreMasterVolume(target, 0);
-                    finishHandling();
-                }
-            }, RESTORE_DELAY_MS);
+        if (root != null) root.recycle();
+
+        if (alertSeen && !alertUp) {
+            Log.i(TAG, "alert dismissed after " + attempt + " polls");
+            restoreMasterVolume(target, 0);
+            finishHandling();
             return;
         }
         if (attempt >= MAX_POLLS) {
-            Log.w(TAG, "OK button never became clickable; restoring master volume anyway");
+            Log.w(TAG, alertSeen
+                    ? "alert still up after " + attempt + " polls; giving up on tap"
+                    : "alert never became foreground; giving up on tap");
             restoreMasterVolume(target, 0);
             finishHandling();
             return;
@@ -401,17 +416,48 @@ public class VolGuardService extends AccessibilityService {
         }, POLL_MS);
     }
 
-    private boolean clickFirstEnabledButton(AccessibilityNodeInfo node) {
+    /**
+     * Root of Sony's alert, or null if it is not on screen. The active window is
+     * checked first, then every window: another dialog (a USB-mode prompt, a
+     * notification) can sit on top of the alert and take focus, and the alert still
+     * needs its OK tapped in that case.
+     */
+    private AccessibilityNodeInfo findAlertRoot() {
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (isAlert(root)) return root;
+        if (root != null) root.recycle();
+        try {
+            for (AccessibilityWindowInfo w : getWindows()) {
+                AccessibilityNodeInfo r = w.getRoot();
+                if (isAlert(r)) return r;
+                if (r != null) r.recycle();
+            }
+        } catch (Exception ignore) { }
+        return null;
+    }
+
+    private boolean isAlert(AccessibilityNodeInfo node) {
+        return node != null && node.getPackageName() != null
+                && ALERT_PKG.contentEquals(node.getPackageName());
+    }
+
+    /** Matches Sony's OK button by id so no other control can be hit. */
+    private boolean clickOkButton(AccessibilityNodeInfo node) {
         if (node == null) return false;
-        CharSequence cls = node.getClassName();
-        boolean isButton = cls != null && cls.toString().contains("Button");
-        if (isButton && node.isClickable() && node.isEnabled() && node.isVisibleToUser()) {
-            return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+        if (node.isClickable() && node.isEnabled() && node.isVisibleToUser()) {
+            String id = node.getViewIdResourceName();
+            CharSequence cls = node.getClassName();
+            // Prefer the id; fall back to class because ids are only reported when
+            // the service asks for them. Safe either way: this only ever walks a
+            // tree already confirmed to be Sony's alert window.
+            boolean isOk = OK_BUTTON_ID.equals(id)
+                    || (id == null && cls != null && cls.toString().contains("Button"));
+            if (isOk) return node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
         }
         for (int i = 0; i < node.getChildCount(); i++) {
             AccessibilityNodeInfo child = node.getChild(i);
             if (child != null) {
-                boolean r = clickFirstEnabledButton(child);
+                boolean r = clickOkButton(child);
                 child.recycle();
                 if (r) return true;
             }

@@ -3,6 +3,7 @@
     android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
     android:accessibilityFeedbackType="feedbackGeneric"
     android:canRetrieveWindowContent="true"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds"
     android:notificationTimeout="0"
     android:packageNames="com.sony.walkman.VolumeCtrlAlert"
     android:description="@string/accessibility_description"/>
