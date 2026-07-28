@@ -3,11 +3,12 @@
 Accessibility service for **Sony NW-A300** players (tested on NW-A306) with EU-style
 “Check volume level” firmware.
 
-When Sony clamps volume and shows that dialog, VolGuard accepts the safety gate,
-restores **Walkman master volume** (0–120) to the level you had before the drop, and
-dismisses the dialog. **No root.**
+VolGuard makes that warning rare by stopping Sony's exposure timer while you are not
+listening, and cleans it up when it does fire — accepting the safety gate, restoring
+**Walkman master volume** (0–120) to the level you had before the drop, and dismissing
+the dialog. **No root.**
 
-Latest: [v1.3.1](../../releases/tag/v1.3.1)
+Latest: [v1.5.0](../../releases/tag/v1.5.0)
 
 ## Disclaimer
 
@@ -16,44 +17,77 @@ with Sony.
 
 ## The problem
 
-On EU firmware, past a threshold Sony:
+Sony runs an exposure timer. Whenever headphones are connected **and** master
+volume is above a fixed threshold, it accumulates time; once the total reaches the
+firmware limit it:
 
 1. Drops master volume (often to ~50)
 2. Shows “Check volume level”
 3. Keeps OK unusable for about **three seconds**
 4. Expects you to confirm, then turn the volume back up
 
-That loop is inside Sony’s volume stack. Without root you cannot remove it — only
-react after it fires.
+The timer does not check whether anything is playing, and it counts through standby.
+So the budget burns just as fast while the player sits paused in your bag as it does
+while you listen. That is why the warning shows up sooner than your actual listening
+time would suggest.
 
 ## What VolGuard does
 
-- Restores the **exact** pre-drop master level (if you were at 120, you get 120)
+- **Stops the budget burning while you are not listening.** With the screen off and
+  nothing playing, it holds master volume at Sony’s own safe level, which stops the
+  timer, and puts your exact level back the moment the screen wakes or playback
+  starts. Nothing is audible, because it only ever happens during silence.
+- Restores the **exact** pre-drop master level when a warning does fire (if you were
+  at 120, you get 120)
 - Accepts Sony’s safe-volume gate so that restore can stick
 - Taps OK for you once Sony enables the button, so the dialog leaves cleanly
-- Does **not** stop the dialog from appearing (that needs root)
+- Does **not** stop the warning forever — it makes it much rarer, and handles it
+  when it comes
 
 ## What to expect
 
 | | |
 |--|--|
+| Warnings | Much rarer, because idle time no longer costs budget |
 | Volume back | Typically tens of milliseconds after the clamp (see [Timing](#timing-nw-a306)) |
 | Dialog | Still appears; fully gone after ~3.5 s (Sony’s OK delay) |
 | Hands-free | Yes, once accessibility is enabled |
-| Permanent silence of the check | No — Sony can rearm later; VolGuard handles the next trip |
+| Permanent silence of the check | No — the budget runs out eventually; VolGuard handles that trip |
 
 Notes:
 
-- First-time / rearm threshold depends on unit and output. On the measured A306 it
-  often trips around **master 80**, not only at 120.
-- After a successful accept, volume above the threshold is free until Sony’s rules
-  re-enable the check (first-time flag and/or long listening timer).
+- The threshold depends on unit and output. What matters is that Sony counts *time
+  spent above it*, not loudness — so the only thing that slows the budget down is
+  spending less time with the volume up.
+- **Idle suppression pauses the budget; it does not refund it.** The counter lives in
+  firmware storage no app can write, so suppression only stops it advancing — Sony
+  banks the time already counted. Accepting a real warning is what resets it, exactly
+  as tapping OK yourself would.
 - VolGuard remembers your last chosen master level so a clamp after reboot can
   still restore correctly.
+- Idle suppression needs the screen off. If you leave the player awake and paused
+  with the volume up, the budget still burns.
+
+### Known limitation: wired output
+
+Idle suppression is verified on the 3.5 mm output. On Bluetooth and USB, Sony measures
+the **Android media volume** rather than the Walkman master
+(`OutputId.nonObservable()` → `getMediaVolume()`), while VolGuard lowers the master —
+so suppression may do nothing there. Untested; the reactive handling is unaffected.
 
 ## How it works
 
-### Plain terms
+### Idle suppression
+
+Sony's timer runs on one condition: an output is connected and master volume is
+above the threshold. Writing a lower level makes Sony stop the timer itself, and it
+banks the time already counted rather than discarding it. So VolGuard waits 30 s
+after the screen goes off with nothing playing, drops the level to Sony's own safe
+value, and puts your level back on screen-on, playback start, or if you touch the
+volume yourself. If VolGuard is killed while a level is owed back, it restores on
+next start.
+
+### Reacting to the warning
 
 1. Sony drops volume and starts the confirmation flow.
 2. VolGuard notices immediately (it does not wait for the dialog to finish drawing).
@@ -104,14 +138,19 @@ that triggers re-show.
 
 ## Timing (NW-A306)
 
-Device: NW-A306. Version: **v1.3.1**.  
-**t = 0** is Sony’s clamp / confirm (not dialog `Displayed`).
+Device: NW-A306.
 
-| Metric | Result |
-|--------|--------|
-| Volume restored to pre-clamp level | **~44–70 ms** |
-| Dialog dismissed (OK usable + tap) | **~3.5 s** |
-| v1.2.0 restore (same class of test) | ~1.36–1.42 s |
+| Metric | Result | Measured on |
+|--------|--------|-------------|
+| Idle restore, playback start → level written | **3–6 ms** | v1.5.0 |
+| Volume restored to pre-clamp level | **~44–70 ms** | v1.3.1 |
+| Dialog dismissed (OK usable + tap) | **~3.5 s** | v1.3.1 |
+| v1.2.0 restore (same class of test) | ~1.36–1.42 s | v1.2.0 |
+
+For the clamp rows, **t = 0** is Sony’s clamp / confirm (not dialog `Displayed`). The
+clamp-handling code is unchanged since v1.3.1. The idle-restore figure is the gap
+between the audio track actually starting (`player piid:N event:started`) and
+`SafeVolume: setVolume:` — short enough that playback does not begin quiet.
 
 Interpretation:
 
@@ -152,8 +191,11 @@ stops working.
 |---------|--------------|-------------|
 | Nothing happens | Service disabled | Re-enable under Accessibility |
 | Volume stays at the floor | Accept/restore failed, or no remembered level | Keep the service on while you set volume once; check logs |
-| Dialog never closes | Another dialog on top, or old build | Clear USB/system prompts; use 1.3.1+ |
-| Dialog returns after long listening | Sony rearmed safe volume | Expected; VolGuard should handle the next trip |
+| Dialog never closes | Another dialog on top, or old build | Clear USB/system prompts; use 1.5.0+ |
+| Stopped working right after an update | `install -r` left the service unbound | Re-set `enabled_accessibility_services` (see Install); writing `""` returns `Bad arguments`, so set the value directly |
+| Warnings as often as before | Output is Bluetooth/USB, or the screen rarely goes off | See [Known limitation](#known-limitation-wired-output) |
+| Dialog returns after long listening | Sony's exposure budget ran out again | Expected; VolGuard handles the next trip |
+| Player quiet after a crash | Suppression was not restored | Turn the screen on; VolGuard restores on next start |
 
 Logs:
 
@@ -161,14 +203,29 @@ Logs:
 adb logcat -s VolGuard:I
 ```
 
-Useful lines: `trip via`, `restore target=`, `restore exact OK: master=`.
+Useful lines: `trip via`, `restore target=`, `restore exact OK: master=`, `idle:`.
+
+To check idle suppression is really stopping Sony's counter, watch Sony's own tag:
+
+```sh
+adb logcat -s SafeVolume:D
+```
+
+`timer stop.` should follow VolGuard's `idle: suppressed`, and `count up:` should
+stop advancing until the level is restored.
+
+If suppression never arms, `adb logcat -s VolGuard:D` adds a line every 30 s naming
+the reason (`idle: waiting (screenOn=… musicActive=…)`).
 
 ## Build
 
-Android SDK **build-tools + platform 34**, **JDK 17** (newer JDKs break `d8`):
+Android SDK **build-tools + platform 34**, **JDK 17** (newer JDKs break `d8`).
+
+`build.sh` calls `javac` and `keytool` directly, so JDK 17 has to be on `PATH` —
+setting `JAVA_HOME` alone is not enough:
 
 ```sh
-ANDROID_HOME=/path/to/android-sdk JAVA_HOME=/path/to/jdk17 bash build.sh
+ANDROID_HOME=/path/to/android-sdk PATH=/path/to/jdk17/bin:$PATH bash build.sh
 ```
 
 Produces `volguard.apk` in the repo root.
