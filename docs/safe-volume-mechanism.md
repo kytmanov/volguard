@@ -116,7 +116,8 @@ Driven with the silent exposure rig on an NW-A306 at master 120, screen off. Dev
   minute in that window is 1170, which matches the `SAFE_VOLUME_TIME_LIMIT_MINUTES` name.
   Round-hour values 12 h through 19 h were each excluded by watching the counter pass them.
 - **Restore latency: 46 ms** from `requestSafeVolumeConfirm` to the level being written, 85 ms
-  to the verified read-back. Consistent with the README's 44–70 ms from v1.3.1.
+  to the verified read-back. Consistent with the 44–70 ms from v1.3.1 in
+  [how-it-works.md](how-it-works.md).
 - `panelStatus=2` (STATUS_SAFE_VOLUME) on the first restore while `nowIzm=120` — the panel
   rejected the write and the Izm path took it anyway. This is why restore goes through Izm
   `setVolume` rather than the panel.
