@@ -1,4 +1,4 @@
-# VolGuard
+# VolGuard - Sony NW-A306 Volume cap fix
 
 Sony NW-A300 players sold in the EU interrupt loud listening with a "Check volume
 level" warning. The volume drops, a dialog appears, and the music stops until you
