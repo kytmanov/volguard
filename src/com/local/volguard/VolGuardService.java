@@ -580,6 +580,11 @@ public class VolGuardService extends AccessibilityService {
      * retry: either this is fast enough to go unnoticed, or playback has visibly stopped
      * and the user reaches for the button, in which case a late automatic play would
      * collide with their press and pause the track instead.
+     *
+     * The stop event is also the earliest trigger available, which is not obvious and was
+     * measured: Sony's player ignores a play until it has finished handling the focus
+     * loss, and publishing this state is what marks that. Dispatching earlier, on a timer
+     * from beginTrip, was tried and changes nothing. See docs/safe-volume-mechanism.md.
      */
     private void resumePlayback() {
         String pkg = resumePkg;

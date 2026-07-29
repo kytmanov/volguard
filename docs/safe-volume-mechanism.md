@@ -140,7 +140,8 @@ Driven with the silent exposure rig on an NW-A306 at master 120, screen off. Dev
 
   Consequence worth acting on: **a real warning always kills playback.** VolGuard restores the
   volume but leaves the music stopped. Since 1.6.0 holds a `MediaController` for playback
-  detection, `getTransportControls().play()` after dismissal would close that gap.
+  detection, `getTransportControls().play()` puts it back — see the next section for how fast
+  that can be, which is not as fast as it looks.
 - **With the screen off the dialog never becomes foreground**, so `tryClickOk` exhausts its
   polls and logs `alert never became foreground`. The activity stays in the back stack —
   `visible=true visibleRequested=false`, `launchedFromPackage=com.sony.walkman.volumectrlpanel`
@@ -153,6 +154,44 @@ Driven with the silent exposure rig on an NW-A306 at master 120, screen off. Dev
   a few seconds when someone is looking at the screen. It does not change *whether* playback
   stops, since the focus loss is immediate and permanent, but it is an argument for dismissing
   the alert without waiting for it to become foreground.
+
+## How fast playback can be resumed — the player sets the floor, not us
+
+Sony's player ignores a `play` until it has finished handling the focus loss. Publishing the
+stopped `PlaybackState` to its `MediaSession` is what marks that moment, and once it has passed
+the player acts in **~50 ms**. Before it, a play is not honoured, whoever sends it.
+
+Measured on NW-A306, `am start` on the alert, VolGuard 1.6.0+resume. Times are milliseconds
+after the player's `onAudioFocusChange(-1)`:
+
+| run | play dispatched at | state published at | player reclaims focus | track destroyed |
+|---|---|---|---|---|
+| A | 405, 643 (timers), 1094 (stop event) | 1094 | **1127** | 1039 |
+| B | 346 (stop event), 401, 638 (timers) | 346 | **401** | 1035 |
+| C | ~250 (`input keyevent 126`, no VolGuard) | — | **1156** | 1076 |
+
+Read across the rows: the reclaim tracks the publish (+33 ms, +55 ms), not the dispatch. In
+run B a play at 346 ms worked while the same 401 ms and 638 ms dispatches in run A did nothing
+— the difference is that B's player had already published. Run C rules out the transport-control
+API being at fault: a media *key* event behaves identically.
+
+**Sony's focus-loss handling latency is 350–1210 ms and it varies run to run** (n=8 across this
+table and the 1.6.0 baseline; roughly one run in five is fast). That is the whole of the gap.
+The resume rides ~50 ms behind it and cannot be moved forward.
+
+Disproven, do not retry without new evidence:
+
+- **Timers scheduled from `beginTrip`** (attempts at +150/+400 ms, ahead of the stop event).
+  Built and measured; the early dispatches are simply not honoured. Reverted.
+- **Media key event instead of `getTransportControls().play()`** — run C above.
+- **Blaming the audio-track teardown.** `Track ... Destroy` lands ~1035 ms out in every run and
+  for three runs it sat suspiciously close to the reclaim; run B separates them (destroy 1035,
+  reclaim 401). Teardown is not the gate.
+
+So the stop-event trigger already resumes as early as this device permits, and the remaining
+gap is not addressable from outside Sony's player. Making a warning genuinely unnoticeable
+needs the trip to happen while nothing is playing — the exposure-budget steering described
+above — not a faster resume.
 
 ## The dialog cannot wake the screen
 
