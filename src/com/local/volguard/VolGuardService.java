@@ -425,7 +425,13 @@ public class VolGuardService extends AccessibilityService {
             try {
                 c.registerCallback(controllerCallback, handler);
                 watchedControllers.add(c);
-                playing |= isPlayingState(c.getPlaybackState());
+                // Seed lastPlayingPkg too, not just the edge flag below: a trip can fire
+                // before Sony's periodic PlaybackState republish reaches the callback,
+                // and without this a service restart mid-playback reads as resumePkg=null.
+                if (isPlayingState(c.getPlaybackState())) {
+                    playing = true;
+                    lastPlayingPkg = c.getPackageName();
+                }
             } catch (Exception ignore) { }
         }
         // Seed the edge detector from reality. Left at its default it would swallow the
