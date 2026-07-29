@@ -179,6 +179,12 @@ API being at fault: a media *key* event behaves identically.
 table and the 1.6.0 baseline; roughly one run in five is fast). That is the whole of the gap.
 The resume rides ~50 ms behind it and cannot be moved forward.
 
+**Judged acceptable by ear on 2026-07-29**, on real audio through headphones at master 91 —
+seven consecutive trips at 377, 387, 408, 512, 680, 1118 and 1166 ms, including the slow case
+twice. The verdict was that it reads as a hiccup in the music rather than a stop. This was the
+open acceptance criterion for the feature and it is now settled; no log value substitutes for
+it, so do not reopen it from timings alone.
+
 Disproven, do not retry without new evidence:
 
 - **Timers scheduled from `beginTrip`** (attempts at +150/+400 ms, ahead of the stop event).
