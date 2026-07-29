@@ -160,6 +160,10 @@ public class VolGuardService extends AccessibilityService {
     private boolean sessionListenerRegistered = false;
     /** Last playing/not-playing edge seen from a session, to ignore position ticks. */
     private boolean lastSessionPlaying = false;
+    /** Package last seen playing, so a trip can tell what to put back. */
+    private String lastPlayingPkg;
+    /** Player to resume for the trip in progress; null means do nothing. */
+    private String resumePkg;
 
     // Per-trip state.
     private int restoreTarget = -1;
@@ -355,6 +359,10 @@ public class VolGuardService extends AccessibilityService {
         @Override public void onPlaybackStateChanged(
                 android.media.session.PlaybackState state) {
             boolean playing = isPlayingState(state);
+            if (playing) {
+                String p = playingPackage();
+                if (p != null) lastPlayingPkg = p;
+            }
             // A restore is never optional. Holding the level down while audio plays is
             // audible, so this path ignores the de-duplication below entirely rather
             // than trust a flag to be in sync.
@@ -540,6 +548,16 @@ public class VolGuardService extends AccessibilityService {
             default:
                 return false;
         }
+    }
+
+    /** Package of a controller reporting playback right now, or null. */
+    private String playingPackage() {
+        for (android.media.session.MediaController c : watchedControllers) {
+            try {
+                if (isPlayingState(c.getPlaybackState())) return c.getPackageName();
+            } catch (Exception ignore) { }
+        }
+        return null;
     }
 
     private ComponentName listenerComponent() {
@@ -844,6 +862,12 @@ public class VolGuardService extends AccessibilityService {
         restoreDone = false;
         okTapStarted = false;
         alertSeen = false;
+        // Snapshot before Sony's alert takes audio focus and stops the player. On the
+        // izm-confirm path this runs ~95 ms ahead of that, so the session still reads
+        // as playing. On the dialog fallback path playback is already dead and this is
+        // null, which is deliberate: a user-paused player is indistinguishable from a
+        // dialog-killed one, so we decline to guess.
+        resumePkg = (isPlaybackActive() || lastSessionPlaying) ? lastPlayingPkg : null;
         restoreTarget = choosePreClampTarget();
         // Whatever Sony dropped us to during a trip is mDefaultVolumeIndex, which
         // is the level idle suppression should use. Skip it when we were the ones
@@ -856,7 +880,7 @@ public class VolGuardService extends AccessibilityService {
                 + " (preClamp=" + preClampMaster
                 + " desired=" + desiredMaster
                 + " prev=" + prevMaster
-                + " lastKnown=" + lastKnownMaster + ")");
+                + " lastKnown=" + lastKnownMaster + " resumePkg=" + resumePkg + ")");
         gatePoll(0);
     }
 
@@ -1258,6 +1282,7 @@ public class VolGuardService extends AccessibilityService {
         handler.postDelayed(new Runnable() {
             @Override public void run() {
                 alertActive = false;
+                resumePkg = null;
                 // Re-arm the idle loop. Everything on the way here either cancelled the
                 // pending check (endSuppression) or hit the alertActive guard and
                 // returned without rescheduling, so this is the only place that reliably
