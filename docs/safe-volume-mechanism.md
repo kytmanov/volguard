@@ -120,15 +120,39 @@ Driven with the silent exposure rig on an NW-A306 at master 120, screen off. Dev
 - `panelStatus=2` (STATUS_SAFE_VOLUME) on the first restore while `nowIzm=120` — the panel
   rejected the write and the Izm path took it anyway. This is why restore goes through Izm
   `setVolume` rather than the panel.
-- **The player stops on the clamp.** Playback was running before the trip and the next idle
-  check reported `nothing playing`. Anything relying on playback continuing across a trip has
-  to account for that.
+- **The dialog stops playback — not the clamp, and not VolGuard.** `VolumeCtrlAlertActivity`
+  requests `AUDIOFOCUS_GAIN` (`req=1`, `USAGE_MEDIA/CONTENT_TYPE_MUSIC`) when it starts. The
+  player receives `AUDIOFOCUS_LOSS (-1)`, drops its track and does not auto-resume, which is
+  the "pause-without-resume" seen in earlier experiments.
+
+  ```
+  23:01:51.828  izm_master_volume=50        <- the clamp; playback continues
+  23:01:51.906  setVolume: 120              <- VolGuard's restore; still playing
+  23:01:51.980  requestAudioFocus() uid 10148  callingPack=com.sony.walkman.VolumeCtrlAlert
+  23:01:51.982  onAudioFocusChange(-1) -> PlaybackService
+  23:01:52.750  Track[HighRes(Red)] has been destroyed
+  ```
+
+  An earlier reading of this blamed the clamp. That was wrong: playback survives the clamp
+  and the restore, and dies only when the dialog takes focus. Confirmed by a control run with
+  the accessibility service disabled (`Bound services:{}`) — `am start` on the alert alone
+  reproduces the identical sequence, so no VolGuard version can be responsible.
+
+  Consequence worth acting on: **a real warning always kills playback.** VolGuard restores the
+  volume but leaves the music stopped. Since 1.6.0 holds a `MediaController` for playback
+  detection, `getTransportControls().play()` after dismissal would close that gap.
 - **With the screen off the dialog never becomes foreground**, so `tryClickOk` exhausts its
   polls and logs `alert never became foreground`. The activity stays in the back stack —
   `visible=true visibleRequested=false`, `launchedFromPackage=com.sony.walkman.volumectrlpanel`
   — and surfaces on the next wake, where VolGuard picks it up as `trip via dialog` and
   dismisses it (`OK clicked`, `alert dismissed`) about 3.2 s later. So a screen-off trip costs
   the user one dialog on their next wake, already accepted and self-dismissing.
+
+  This is the one place the current design is worse than a screen-on trip: the alert holds
+  audio focus for as long as it sits undismissed — three minutes in the recorded run, against
+  a few seconds when someone is looking at the screen. It does not change *whether* playback
+  stops, since the focus loss is immediate and permanent, but it is an argument for dismissing
+  the alert without waiting for it to become foreground.
 
 ## The dialog cannot wake the screen
 
