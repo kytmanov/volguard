@@ -14,6 +14,7 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.Parcel;
 import android.os.RemoteException;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
@@ -95,6 +96,14 @@ public class VolGuardService extends AccessibilityService {
     private static final int RESTORE_MAX_ATTEMPTS = 60;
     private static final int RESTORE_DELAY_MS = 350;
     private static final int REARM_DELAY_MS = 600;
+    /**
+     * How stale a playback sighting may be and still count as "was playing when the
+     * trip started". Long enough for the dialog path, where VolGuard learns of the trip
+     * 230-820 ms late and both live playback signals have already gone false. Short
+     * enough that a screen-off trip — noticed on the next wake, minutes later — still
+     * declines, and that music the user paused themselves is not restarted.
+     */
+    private static final int RESUME_RECENCY_MS = 3000;
     private static final String PREFS = "volguard";
     private static final String KEY_LAST_MASTER = "last_master";
     private static final String KEY_CLAMP_FLOOR = "clamp_floor";
@@ -162,6 +171,9 @@ public class VolGuardService extends AccessibilityService {
     private boolean lastSessionPlaying = false;
     /** Package last seen playing, so a trip can tell what to put back. */
     private String lastPlayingPkg;
+    /** elapsedRealtime when playback was last live — a start, or the stop that ended
+     *  it. See RESUME_RECENCY_MS. */
+    private long lastPlayingAt;
     /** Player to resume for the trip in progress; null means do nothing. */
     private String resumePkg;
 
@@ -361,7 +373,10 @@ public class VolGuardService extends AccessibilityService {
             boolean playing = isPlayingState(state);
             if (playing) {
                 String p = playingPackage();
-                if (p != null) lastPlayingPkg = p;
+                if (p != null) {
+                    lastPlayingPkg = p;
+                    lastPlayingAt = SystemClock.elapsedRealtime();
+                }
             }
             // A restore is never optional. Holding the level down while audio plays is
             // audible, so this path ignores the de-duplication below entirely rather
@@ -378,6 +393,12 @@ public class VolGuardService extends AccessibilityService {
             // silence in the log. Only real transitions are events.
             if (playing == lastSessionPlaying) return;
             lastSessionPlaying = playing;
+            // A stop edge is the last instant playback was live, so stamp it too. On the
+            // dialog path this edge routinely arrives before VolGuard knows a trip is
+            // under way — the stop is seen, alertActive is still false, and by beginTrip
+            // every signal reads stopped. Without this the trip cannot tell that music
+            // was playing a moment ago, and declines to resume it.
+            if (!playing) lastPlayingAt = SystemClock.elapsedRealtime();
             // Sony's alert has just killed playback mid-trip. Put it straight back.
             if (!playing && alertActive) resumePlayback();
             if (playing) endSuppression("playback started", true);
@@ -433,6 +454,7 @@ public class VolGuardService extends AccessibilityService {
                 if (isPlayingState(c.getPlaybackState())) {
                     playing = true;
                     lastPlayingPkg = c.getPackageName();
+                    lastPlayingAt = SystemClock.elapsedRealtime();
                 }
             } catch (Exception ignore) { }
         }
@@ -556,6 +578,12 @@ public class VolGuardService extends AccessibilityService {
             default:
                 return false;
         }
+    }
+
+    /** True if a player was seen playing within RESUME_RECENCY_MS. */
+    private boolean playedRecently() {
+        return lastPlayingAt > 0
+                && SystemClock.elapsedRealtime() - lastPlayingAt < RESUME_RECENCY_MS;
     }
 
     /** Package of a controller reporting playback right now, or null. */
@@ -908,11 +936,20 @@ public class VolGuardService extends AccessibilityService {
         okTapStarted = false;
         alertSeen = false;
         // Snapshot before Sony's alert takes audio focus and stops the player. On the
-        // izm-confirm path this runs ~95 ms ahead of that, so the session still reads
-        // as playing. On the dialog fallback path playback is already dead and this is
-        // null, which is deliberate: a user-paused player is indistinguishable from a
-        // dialog-killed one, so we decline to guess.
-        resumePkg = (isPlaybackActive() || lastSessionPlaying) ? lastPlayingPkg : null;
+        // izm-confirm path this runs ~95 ms ahead of that, so playback is still live.
+        // On the dialog fallback path VolGuard arrives 230-820 ms late and the cached
+        // edge flag can be stale by then — measured at 81 s stale while music actually
+        // played, giving no resume at all in 4 of 6 runs. So ask the session directly
+        // rather than trust the flag: Sony takes 350-1210 ms to publish the stop, and
+        // here that lag works in our favour, still naming the player that was playing.
+        String livePkg = playingPackage();
+        if (livePkg != null) {
+            lastPlayingPkg = livePkg;
+            lastPlayingAt = SystemClock.elapsedRealtime();
+        }
+        resumePkg = (livePkg != null || isPlaybackActive() || lastSessionPlaying
+                || playedRecently()) ? lastPlayingPkg : null;
+        boolean resumeNow = resumePkg != null && !lastSessionPlaying;
         restoreTarget = choosePreClampTarget();
         // Whatever Sony dropped us to during a trip is mDefaultVolumeIndex, which
         // is the level idle suppression should use. Skip it when we were the ones
@@ -925,7 +962,22 @@ public class VolGuardService extends AccessibilityService {
                 + " (preClamp=" + preClampMaster
                 + " desired=" + desiredMaster
                 + " prev=" + prevMaster
-                + " lastKnown=" + lastKnownMaster + " resumePkg=" + resumePkg + ")");
+                + " lastKnown=" + lastKnownMaster + " resumePkg=" + resumePkg
+                // The three inputs to that capture. Without them a null reads as
+                // "nothing was playing" when it may be a missed signal instead.
+                + " [active=" + isPlaybackActive()
+                + " sessionPlaying=" + lastSessionPlaying
+                + " lastPlaying=" + lastPlayingPkg
+                + " age=" + (lastPlayingAt > 0
+                        ? (SystemClock.elapsedRealtime() - lastPlayingAt) + "ms" : "never")
+                + "])");
+        // If playback had already stopped when we got here, no further stop event is
+        // coming and waiting for one waits forever. Resume now instead: Sony has
+        // published the stop, and that is exactly when the player starts honouring a
+        // play. This is not the disproven early timer — that fired *before* the publish,
+        // which the player ignores. On the izm-confirm path the stop is still ahead of
+        // us, lastSessionPlaying is true, and the stop event stays in charge.
+        if (resumeNow) resumePlayback();
         gatePoll(0);
     }
 
