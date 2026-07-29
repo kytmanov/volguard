@@ -30,5 +30,19 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config"/>
         </service>
+
+        <!--
+            Not used to read notifications. It is the only way to get a ComponentName
+            that MediaSessionManager.getActiveSessions() will accept, which is how idle
+            suppression learns whether music is really playing.
+        -->
+        <service
+            android:name=".VolGuardNotificationListener"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService"/>
+            </intent-filter>
+        </service>
     </application>
 </manifest>

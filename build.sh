@@ -12,8 +12,13 @@ PLATFORM="$ANDROID_HOME/platforms/android-34/android.jar"
 JT="${JAVA_TARGET:-11}"                              # bytecode level d8 accepts
 
 AAPT2="$BT/aapt2"; D8="$BT/d8"; ZIPALIGN="$BT/zipalign"; APKSIGNER="$BT/apksigner"
+# build-tools 34's d8 (8.2.2) NPEs on any anonymous inner class emitted by a modern
+# javac. cmdline-tools ships a much newer d8; prefer it when it is there.
+CMDLINE_D8="$ANDROID_HOME/cmdline-tools/latest/bin/d8"
+[ -x "$CMDLINE_D8" ] && D8="$CMDLINE_D8"
 echo "ANDROID_HOME=$ANDROID_HOME"
 echo "build-tools=$BT"
+echo "d8=$D8"
 
 OUT="$HERE/build"
 rm -rf "$OUT"; mkdir -p "$OUT/classes"
@@ -22,7 +27,7 @@ rm -rf "$OUT"; mkdir -p "$OUT/classes"
 "$AAPT2" compile --dir res -o "$OUT/compiled.zip"
 "$AAPT2" link -o "$OUT/base.apk" -I "$PLATFORM" \
   --manifest AndroidManifest.xml --java "$OUT/gen" \
-  --min-sdk-version 26 --target-sdk-version 34 --version-code 6 --version-name 1.5.0 \
+  --min-sdk-version 26 --target-sdk-version 34 --version-code 7 --version-name 1.6.0 \
   "$OUT/compiled.zip"
 
 # 2) compile java against android.jar

@@ -114,6 +114,8 @@ public class VolGuardService extends AccessibilityService {
      * screen off — so a long delay would buy nothing and lose the overnight case.
      */
     private static final int SUPPRESS_DELAY_MS = 30000;
+    /** Cadence of the safety re-check that runs only while the level is held down. */
+    private static final int SUPPRESSED_POLL_MS = 30000;
     /** Sudden drop at least this large is treated as Sony's clamp, not a user action. */
     private static final int CLAMP_DROP_MIN = 15;
     private static final int DEFAULT_MASTER_MAX = 120;
@@ -152,6 +154,12 @@ public class VolGuardService extends AccessibilityService {
     /** The level we wrote, so our own MASTER_VOLUME_CHANGED is not read as intent. */
     private int suppressedLevel = -1;
     private int clampFloor = DEFAULT_CLAMP_FLOOR;
+    /** Controllers we hold a callback on, so they can be released on teardown. */
+    private final java.util.List<android.media.session.MediaController> watchedControllers =
+            new java.util.ArrayList<android.media.session.MediaController>();
+    private boolean sessionListenerRegistered = false;
+    /** Last playing/not-playing edge seen from a session, to ignore position ticks. */
+    private boolean lastSessionPlaying = false;
 
     // Per-trip state.
     private int restoreTarget = -1;
@@ -282,15 +290,20 @@ public class VolGuardService extends AccessibilityService {
         }
     }
 
+    /**
+     * Sony's player registers a ~1s AudioTrack at playback start and at every track
+     * change, so this fires exactly when playback (re)starts. That blip is the only
+     * part of Sony's playback the platform's player list ever sees — its *absence*
+     * says nothing, which is the trap 1.5.0 fell into. Treat this purely as "something
+     * changed, re-evaluate now" and let isPlaybackActive() decide.
+     */
     private final android.media.AudioManager.AudioPlaybackCallback playbackCallback =
             new android.media.AudioManager.AudioPlaybackCallback() {
         @Override public void onPlaybackConfigChanged(
                 java.util.List<android.media.AudioPlaybackConfiguration> configs) {
-            if (isMusicActive()) endSuppression("playback started", true);
-            // Re-arm unconditionally. isMusicActive() keeps reporting true for a
-            // moment after playback really stops, so the stop event itself can
-            // read as active — and once the player is released no further event
-            // arrives to correct it. Scheduling either way makes this self-healing.
+            if (isPlaybackActive()) endSuppression("playback started", true);
+            // Re-arm unconditionally, so a stop event that still reads as active
+            // (or a player that goes away without another event) is self-healing.
             scheduleIdleCheck();
         }
     };
@@ -300,17 +313,156 @@ public class VolGuardService extends AccessibilityService {
     };
 
     /**
+     * Last line of defence while the level is held down.
+     *
+     * Both push signals can miss — the session callback needs a permission that may not be
+     * granted, and Sony's start blip is one event that can be lost. Being wrong here is
+     * audible, so pay for one cheap poll rather than wait for the user to wake the screen.
+     * Runs on uptimeMillis, so it does not tick in deep sleep; that is fine, because the
+     * case it guards (audio playing) keeps the CPU awake.
+     */
+    private final Runnable suppressedWatch = new Runnable() {
+        @Override public void run() {
+            if (!suppressed) return;
+            if (isPlaybackActive()) {
+                endSuppression("playback seen while suppressed", true);
+                return;
+            }
+            handler.postDelayed(this, SUPPRESSED_POLL_MS);
+        }
+    };
+
+    /**
+     * Instant restore when a player starts, screen off or not. This is the only signal
+     * that reports Sony's playback truthfully, and it needs notification access.
+     */
+    private final android.media.session.MediaSessionManager.OnActiveSessionsChangedListener
+            sessionsChangedListener =
+            new android.media.session.MediaSessionManager.OnActiveSessionsChangedListener() {
+        @Override public void onActiveSessionsChanged(
+                java.util.List<android.media.session.MediaController> controllers) {
+            watchControllers(controllers);
+            if (isPlaybackActive()) endSuppression("playback started", true);
+            // Always re-arm. endSuppression() cancels the pending idle check and, when
+            // nothing was suppressed, returns without putting one back — so a branch
+            // that only calls it would strand the idle loop for good.
+            scheduleIdleCheck();
+        }
+    };
+
+    private final android.media.session.MediaController.Callback controllerCallback =
+            new android.media.session.MediaController.Callback() {
+        @Override public void onPlaybackStateChanged(
+                android.media.session.PlaybackState state) {
+            boolean playing = isPlayingState(state);
+            // A restore is never optional. Holding the level down while audio plays is
+            // audible, so this path ignores the de-duplication below entirely rather
+            // than trust a flag to be in sync.
+            if (playing && suppressed) {
+                lastSessionPlaying = true;
+                endSuppression("playback started", true);
+                scheduleIdleCheck();
+                return;
+            }
+            // Sony republishes PlaybackState continuously while a track runs (position
+            // updates). Acting on every one of those re-armed the 30 s idle timer over
+            // and over, so the check never ran again — measured as six minutes of total
+            // silence in the log. Only real transitions are events.
+            if (playing == lastSessionPlaying) return;
+            lastSessionPlaying = playing;
+            if (playing) endSuppression("playback started", true);
+            scheduleIdleCheck();
+        }
+
+        @Override public void onSessionDestroyed() { scheduleIdleCheck(); }
+    };
+
+    /**
+     * Attach to the current sessions, dropping the previous set.
+     *
+     * Registration is attempted repeatedly rather than once at connect: notification
+     * access is granted in Settings while this service is already running, and an
+     * accessibility service is not restarted when that happens.
+     */
+    private void registerSessionListener() {
+        if (sessionListenerRegistered) return;
+        try {
+            android.media.session.MediaSessionManager msm =
+                    (android.media.session.MediaSessionManager)
+                            getSystemService(Context.MEDIA_SESSION_SERVICE);
+            if (msm == null) return;
+            ComponentName component = listenerComponent();
+            msm.addOnActiveSessionsChangedListener(
+                    sessionsChangedListener, component, handler);
+            sessionListenerRegistered = true;
+            watchControllers(msm.getActiveSessions(component));
+            Log.i(TAG, "media session access granted; playback detection is exact");
+        } catch (SecurityException e) {
+            // Notification access not granted. Nothing to log every 30s about; the
+            // state is reported once in onServiceConnected and in the app UI.
+        } catch (Exception e) {
+            Log.w(TAG, "media session listener registration failed", e);
+        }
+    }
+
+    private void watchControllers(
+            java.util.List<android.media.session.MediaController> controllers) {
+        for (android.media.session.MediaController c : watchedControllers) {
+            try { c.unregisterCallback(controllerCallback); } catch (Exception ignore) { }
+        }
+        watchedControllers.clear();
+        if (controllers == null) return;
+        boolean playing = false;
+        for (android.media.session.MediaController c : controllers) {
+            try {
+                c.registerCallback(controllerCallback, handler);
+                watchedControllers.add(c);
+                playing |= isPlayingState(c.getPlaybackState());
+            } catch (Exception ignore) { }
+        }
+        // Seed the edge detector from reality. Left at its default it would swallow the
+        // first transition — observed on device: a pause during playback produced no
+        // callback action at all, because "not playing" already matched the flag.
+        lastSessionPlaying = playing;
+    }
+
+    /** Session state is unknown — no notification access, or no session to ask. */
+    private static final int PLAYBACK_UNKNOWN = -1;
+    private static final int PLAYBACK_IDLE = 0;
+    private static final int PLAYBACK_PLAYING = 1;
+
+    /**
      * Whether anything media-like is really playing.
      *
-     * Deliberately not AudioManager.isMusicActive(): on this device Sony's
-     * offload output leaves the music stream reported active indefinitely after
-     * the player is released, so once a single track had played that call never
-     * returned false again and suppression could never arm. The active
-     * playback-configuration list tracks real players, which do drop out.
+     * On the NW-A306 neither platform signal works on its own, and they fail in
+     * opposite directions:
      *
-     * Usage is filtered so a notification blip does not count as listening.
+     * - getActivePlaybackConfigurations() never contains Sony's music at all. The audio
+     *   runs on a native offload AudioTrack (visible only in `dumpsys media.audio_flinger`)
+     *   that is never registered with the platform's playback monitor, so during a song
+     *   the list is empty. Reading that as silence is what dropped the volume mid-track.
+     * - AudioManager.isMusicActive() never misses real audio, but Sony's player can hold
+     *   the output long after playback stops, so it is not usable as a positive signal.
+     *
+     * So: ask the MediaSession when we are allowed to, since that is the only source that
+     * distinguishes playing from paused; otherwise fall back to a conservative OR that can
+     * be wrong in the harmless direction only.
      */
-    private boolean isMusicActive() {
+    private boolean isPlaybackActive() {
+        boolean configs = anyActivePlaybackConfig();
+        if (configs) return true;
+        int session = sessionPlaybackState();
+        if (session != PLAYBACK_UNKNOWN) return session == PLAYBACK_PLAYING;
+        // No authority available. isMusicActive() has no false negatives, so vetoing on
+        // it can never drop the volume during playback; it may simply never arm.
+        return audioManagerSaysMusicActive();
+    }
+
+    /**
+     * Players the platform does know about, filtered by usage so a notification blip
+     * does not count as listening. Catches non-Sony apps, and Sony's start blip.
+     */
+    private boolean anyActivePlaybackConfig() {
         try {
             if (audioManager == null) return true;
             for (android.media.AudioPlaybackConfiguration c
@@ -332,6 +484,74 @@ public class VolGuardService extends AccessibilityService {
         }
     }
 
+    private boolean audioManagerSaysMusicActive() {
+        try {
+            return audioManager == null || audioManager.isMusicActive();
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /**
+     * PLAYBACK_PLAYING / PLAYBACK_IDLE from the active media sessions, or
+     * PLAYBACK_UNKNOWN when they cannot answer.
+     *
+     * An empty session list is UNKNOWN, not idle. A player that tears its session down
+     * while its audio track keeps writing would otherwise read as silence and get the
+     * volume dropped underneath it — the same mistake as trusting an empty player list.
+     *
+     * Not cached: the permission can be granted while the service is running, and this is
+     * one cheap binder call per idle check.
+     */
+    private int sessionPlaybackState() {
+        try {
+            android.media.session.MediaSessionManager msm =
+                    (android.media.session.MediaSessionManager)
+                            getSystemService(Context.MEDIA_SESSION_SERVICE);
+            if (msm == null) return PLAYBACK_UNKNOWN;
+            java.util.List<android.media.session.MediaController> controllers =
+                    msm.getActiveSessions(listenerComponent());
+            if (controllers == null || controllers.isEmpty()) return PLAYBACK_UNKNOWN;
+            for (android.media.session.MediaController c : controllers) {
+                if (isPlayingState(c.getPlaybackState())) return PLAYBACK_PLAYING;
+            }
+            return PLAYBACK_IDLE;
+        } catch (SecurityException e) {
+            // Notification access not granted. Expected; the fallback covers it. Drop
+            // the registration flag too: the system tears the listener down when access
+            // is revoked, so without this a revoke/re-grant cycle would leave polling
+            // working but the push callbacks silently dead until the next restart.
+            sessionListenerRegistered = false;
+            return PLAYBACK_UNKNOWN;
+        } catch (Exception e) {
+            Log.w(TAG, "getActiveSessions failed", e);
+            return PLAYBACK_UNKNOWN;
+        }
+    }
+
+    private boolean isPlayingState(android.media.session.PlaybackState s) {
+        if (s == null) return false;
+        switch (s.getState()) {
+            case android.media.session.PlaybackState.STATE_PLAYING:
+            case android.media.session.PlaybackState.STATE_BUFFERING:
+            case android.media.session.PlaybackState.STATE_FAST_FORWARDING:
+            case android.media.session.PlaybackState.STATE_REWINDING:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private ComponentName listenerComponent() {
+        return new ComponentName(this, VolGuardNotificationListener.class);
+    }
+
+    private String sessionStateName(int state) {
+        if (state == PLAYBACK_PLAYING) return "playing";
+        if (state == PLAYBACK_IDLE) return "idle";
+        return "unavailable";
+    }
+
     private void scheduleIdleCheck() {
         handler.removeCallbacks(idleCheck);
         if (suppressed || alertActive) return;
@@ -340,16 +560,24 @@ public class VolGuardService extends AccessibilityService {
 
     private void suppressIfIdle() {
         if (suppressed || alertActive) return;
+        // Free retry: this runs every SUPPRESS_DELAY_MS while the device is in use, so
+        // access granted after startup is picked up without restarting the service.
+        registerSessionListener();
         // Keep looking while the device is idle-but-not-yet-suppressible. Giving
         // up here is what previously stranded the service: the events that would
         // have restarted the check had already been and gone.
         boolean screen = isScreenOn();
-        boolean music = isMusicActive();
+        boolean music = isPlaybackActive();
         if (screen || music) {
             // Debug level: this repeats every SUPPRESS_DELAY_MS for as long as the
             // device is in use, which would drown the info log. Visible with
-            // `adb logcat -s VolGuard:D` when suppression is not arming.
-            Log.d(TAG, "idle: waiting (screenOn=" + screen + " musicActive=" + music + ")");
+            // `adb logcat -s VolGuard:D` when suppression is not arming. Every signal
+            // is printed separately because the whole class of bugs here is one source
+            // disagreeing with the others.
+            Log.d(TAG, "idle: waiting (screenOn=" + screen + " playing=" + music
+                    + " session=" + sessionStateName(sessionPlaybackState())
+                    + " configs=" + anyActivePlaybackConfig()
+                    + " musicActive=" + audioManagerSaysMusicActive() + ")");
             scheduleIdleCheck();
             return;
         }
@@ -372,6 +600,7 @@ public class VolGuardService extends AccessibilityService {
 
         if (izmSetVolume(clampFloor)) {
             Log.i(TAG, "idle: suppressed " + cur + " -> " + clampFloor);
+            handler.postDelayed(suppressedWatch, SUPPRESSED_POLL_MS);
         } else {
             Log.w(TAG, "idle: suppress write failed; restoring");
             endSuppression("suppress failed", true);
@@ -384,6 +613,7 @@ public class VolGuardService extends AccessibilityService {
      */
     private void endSuppression(String reason, boolean restore) {
         handler.removeCallbacks(idleCheck);
+        handler.removeCallbacks(suppressedWatch);
         if (!suppressed) return;
         int target = suppressRestoreLevel;
         suppressed = false;
@@ -464,6 +694,12 @@ public class VolGuardService extends AccessibilityService {
                         + " loweredTo=" + val
                         + " alertActive=" + alertActive);
             }
+            // A clamp-shaped drop with no trip behind it — the user pulling the slider
+            // down hard while suppressed — has already had its idle check cancelled by
+            // endSuppression() above, and nothing else is coming to put one back. During
+            // a real clamp this is a no-op: alertActive is set, so it returns early and
+            // finishHandling() does the re-arm instead.
+            scheduleIdleCheck();
             return; // never learn the floor as desired
         }
 
@@ -503,12 +739,17 @@ public class VolGuardService extends AccessibilityService {
             Log.w(TAG, "playback callback registration failed", e);
         }
 
+        registerSessionListener();
+
         izmListener.attachInterface(null, IZM_LISTENER_IFACE);
         bindMasterService();
         bindIzmService();
         Log.i(TAG, "connected; desiredMaster=" + desiredMaster
                 + " lastKnownMaster=" + lastKnownMaster
-                + " screenOn=" + isScreenOn() + " clampFloor=" + clampFloor);
+                + " screenOn=" + isScreenOn() + " clampFloor=" + clampFloor
+                + " mediaSessions=" + (sessionListenerRegistered ? "granted"
+                        : "DENIED (idle suppression will stay conservative; "
+                        + "grant notification access to VolGuard)"));
         scheduleIdleCheck();
     }
 
@@ -1015,7 +1256,18 @@ public class VolGuardService extends AccessibilityService {
 
     private void finishHandling() {
         handler.postDelayed(new Runnable() {
-            @Override public void run() { alertActive = false; }
+            @Override public void run() {
+                alertActive = false;
+                // Re-arm the idle loop. Everything on the way here either cancelled the
+                // pending check (endSuppression) or hit the alertActive guard and
+                // returned without rescheduling, so this is the only place that reliably
+                // puts one back. In practice a late MASTER_VOLUME_CHANGED from the final
+                // restore usually re-arms it first — but that is a race against
+                // REARM_DELAY_MS, and a trip with no restore target writes nothing at all
+                // and so broadcasts nothing. Must run after alertActive is cleared:
+                // scheduleIdleCheck() returns early while it is still set.
+                scheduleIdleCheck();
+            }
         }, REARM_DELAY_MS);
     }
 
@@ -1030,6 +1282,18 @@ public class VolGuardService extends AccessibilityService {
         try {
             if (audioManager != null) audioManager.unregisterAudioPlaybackCallback(playbackCallback);
         } catch (Exception ignore) { }
+        watchControllers(null);
+        try {
+            if (sessionListenerRegistered) {
+                android.media.session.MediaSessionManager msm =
+                        (android.media.session.MediaSessionManager)
+                                getSystemService(Context.MEDIA_SESSION_SERVICE);
+                if (msm != null) {
+                    msm.removeOnActiveSessionsChangedListener(sessionsChangedListener);
+                }
+            }
+        } catch (Exception ignore) { }
+        sessionListenerRegistered = false;
         try { izmListenerTx(TX_IZM_UNREGIST_LISTENER); } catch (Exception ignore) { }
         try {
             if (masterBound) unbindService(masterConn);

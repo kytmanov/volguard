@@ -8,7 +8,7 @@ listening, and cleans it up when it does fire — accepting the safety gate, res
 **Walkman master volume** (0–120) to the level you had before the drop, and dismissing
 the dialog. **No root.**
 
-Latest: [v1.5.0](../../releases/tag/v1.5.0)
+Latest: [v1.6.0](../../releases/tag/v1.6.0)
 
 ## Disclaimer
 
@@ -52,6 +52,7 @@ time would suggest.
 | Volume back | Typically tens of milliseconds after the clamp (see [Timing](#timing-nw-a306)) |
 | Dialog | Still appears; fully gone after ~3.5 s (Sony’s OK delay) |
 | Hands-free | Yes, once accessibility is enabled |
+| Volume while listening | Never touched — suppression only runs with nothing playing |
 | Permanent silence of the check | No — the budget runs out eventually; VolGuard handles that trip |
 
 Notes:
@@ -62,7 +63,14 @@ Notes:
 - **Idle suppression pauses the budget; it does not refund it.** The counter lives in
   firmware storage no app can write, so suppression only stops it advancing — Sony
   banks the time already counted. Accepting a real warning is what resets it, exactly
-  as tapping OK yourself would.
+  as tapping OK yourself would. Both halves of that are now measured on an NW-A306: a
+  real trip reset the counter from 70,224,368 ms to ~103,000 ms, so letting VolGuard
+  handle warnings does not make them come back sooner.
+- **The budget is 19.5 hours** (1170 minutes) above the threshold on the test unit, and
+  the threshold is above master 71 there — at 71 the timer never runs at all, so the
+  warning can never fire and idle suppression saves nothing. It earns its keep only when
+  you listen above the threshold. Both figures are per-unit and per-output; measure your
+  own with `adb logcat -s SafeVolume:D` before assuming them.
 - VolGuard remembers your last chosen master level so a clamp after reboot can
   still restore correctly.
 - Idle suppression needs the screen off. If you leave the player awake and paused
@@ -142,15 +150,17 @@ Device: NW-A306.
 
 | Metric | Result | Measured on |
 |--------|--------|-------------|
-| Idle restore, playback start → level written | **3–6 ms** | v1.5.0 |
+| Idle restore, playback start → level written | **44 ms** | v1.6.0 |
+| Volume restored to pre-clamp level, **real trip** | **46 ms** | v1.6.0 |
 | Volume restored to pre-clamp level | **~44–70 ms** | v1.3.1 |
 | Dialog dismissed (OK usable + tap) | **~3.5 s** | v1.3.1 |
 | v1.2.0 restore (same class of test) | ~1.36–1.42 s | v1.2.0 |
 
 For the clamp rows, **t = 0** is Sony’s clamp / confirm (not dialog `Displayed`). The
-clamp-handling code is unchanged since v1.3.1. The idle-restore figure is the gap
-between the audio track actually starting (`player piid:N event:started`) and
-`SafeVolume: setVolume:` — short enough that playback does not begin quiet.
+clamp-handling code is unchanged since v1.3.1. The v1.6.0 clamp row is from a genuine
+firmware-driven trip — the exposure budget actually running out, not `am start` — measured
+from `SafeVolume: requestSafeVolumeConfirm` to `SafeVolume: setVolume: 120`. The idle-restore
+figure is the gap between the media-key press and `restore exact OK`.
 
 Interpretation:
 
@@ -174,16 +184,31 @@ Download `volguard.apk` from [Releases](../../releases).
 adb install volguard.apk
 adb shell settings put secure enabled_accessibility_services com.local.volguard/com.local.volguard.VolGuardService
 adb shell settings put secure accessibility_enabled 1
+adb shell cmd notification allow_listener com.local.volguard/com.local.volguard.VolGuardNotificationListener
 ```
 
 Use `adb -s <serial>` if more than one device is connected.
 
 **Manual**
 
-Settings → Accessibility → **VolGuard** → enable.
+Settings → Accessibility → **VolGuard** → enable, then
+Settings → Notifications → Device & app notifications → **VolGuard** → allow.
 
 Android may turn accessibility services off after app updates; re-enable if it
 stops working.
+
+### Why notification access
+
+Idle suppression has to know whether music is actually playing, and on this device
+Sony's player is invisible to every other playback API — the audio runs on a native
+offload track the platform's player list never sees. The only source that reports it
+truthfully is the media session, and reading that requires notification access.
+
+VolGuard reads no notifications; the listener component exists solely as the token that
+`MediaSessionManager` demands. Skip the grant and everything else still works — idle
+suppression just falls back to a conservative check and will rarely engage. It will
+never lower the volume while you are listening either way. The app's main screen shows
+which mode you are in.
 
 ## Troubleshooting
 
@@ -196,6 +221,8 @@ stops working.
 | Warnings as often as before | Output is Bluetooth/USB, or the screen rarely goes off | See [Known limitation](#known-limitation-wired-output) |
 | Dialog returns after long listening | Sony's exposure budget ran out again | Expected; VolGuard handles the next trip |
 | Player quiet after a crash | Suppression was not restored | Turn the screen on; VolGuard restores on next start |
+| Volume drops mid-song with the screen off | Pre-1.6.0 bug: playback was undetectable | Update to 1.6.0+ and grant notification access |
+| Suppression never engages | Notification access not granted | Grant it (see [Install](#install)); check `mediaSessions=` in the log |
 
 Logs:
 

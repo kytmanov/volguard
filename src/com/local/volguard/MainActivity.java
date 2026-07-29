@@ -17,6 +17,16 @@ public class MainActivity extends Activity {
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        render();
+    }
+
+    /** Rebuilt on resume so the permission status is not stale after a trip to Settings. */
+    @Override protected void onResume() {
+        super.onResume();
+        render();
+    }
+
+    private void render() {
         float d = getResources().getDisplayMetrics().density;
         int pad = (int) (16 * d);
 
@@ -41,6 +51,39 @@ public class MainActivity extends Activity {
         });
         root.addView(btn);
 
+        TextView notif = new TextView(this);
+        notif.setPadding(0, pad, 0, 0);
+        notif.setText(hasNotificationAccess()
+                ? "Notification access: granted.\n\n"
+                        + "Idle suppression is fully active. While the screen is off and "
+                        + "nothing is playing, VolGuard holds the volume down so Sony's "
+                        + "exposure timer stops, and restores it the moment you press play."
+                : "Notification access: not granted.\n\n"
+                        + "Without it VolGuard cannot tell playing from paused on this "
+                        + "device — Sony's player is invisible to every other playback API "
+                        + "— so idle suppression stays conservative and will rarely engage. "
+                        + "Everything else still works.\n\n"
+                        + "VolGuard reads no notifications. The permission exists only "
+                        + "because it is the only way to read media playback state.");
+        root.addView(notif);
+
+        Button notifBtn = new Button(this);
+        notifBtn.setText("Open Notification access settings");
+        notifBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                startActivity(new Intent(
+                        Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+            }
+        });
+        root.addView(notifBtn);
+
         setContentView(root);
+    }
+
+    /** Same check the platform makes before letting us list media sessions. */
+    private boolean hasNotificationAccess() {
+        String enabled = Settings.Secure.getString(
+                getContentResolver(), "enabled_notification_listeners");
+        return enabled != null && enabled.contains(getPackageName());
     }
 }

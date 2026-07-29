@@ -81,10 +81,54 @@ This is the correction that matters most. An earlier experiment called
 nothing at all — saw the counter keep advancing, and concluded that the call "does not
 stop the accumulator". The observation was right and the conclusion was backwards.
 
-**Still unverified:** that VolGuard's reactive accept resets the counter in practice.
-The code path says it must, because the accept happens while the state is ACTIVE, but
-no real trip has been observed end to end since this was understood. On the test unit
-the counter has never been seen to reset. Worth confirming before relying on it.
+**Verified on device.** A real trip was finally driven end to end (see "A real trip,
+measured"): the counter read `70,224,368` on the poll that tripped and `103,158` on the
+next tick after the accept. VolGuard's accept resets the counter exactly as a manual OK
+tap would, so handling trips automatically does **not** make them fire more often — the
+standing worry that it might is settled.
+
+The reset comes from the direct `disableSafeVolume` (txn 10) call, which VolGuard issues
+*before* the broadcast and while the state is still ACTIVE: `SafeVolume: disableSafeVolume`
+and `ACTIVE -> INACTIVE` are logged 1 ms apart, ahead of `AVC_CHECK_LEVEL_OK` going out.
+
+## A real trip, measured
+
+Driven with the silent exposure rig on an NW-A306 at master 120, screen off. Device clock:
+
+```
+23:01:51.749  count up: 70224368          <- the poll that decided isTimeOver()
+23:01:51.820  timer stop.
+23:01:51.825  INACTIVE -> ACTIVE
+23:01:51.858  notifyVolumeStateChanged    <- the clamp; VolGuard later reads cur=50
+23:01:51.860  requestSafeVolumeConfirm
+23:01:51.883  VolGuard: preClamp from desiredMaster=120 (cur=50)
+23:01:51.885  VolGuard: trip via izm-confirm             <- 25 ms after the confirm
+23:01:51.887  VolGuard: panel flag up after 0 polls
+23:01:51.898  ACTIVE -> INACTIVE          <- accept landed, counter reset
+23:01:51.901  VolGuard: sent AVC_CHECK_LEVEL_OK
+23:01:51.906  setVolume: 120              <- level restored, 46 ms after the confirm
+23:01:51.941  timer start.                <- 120 is above threshold again
+23:01:51.945  VolGuard: restore exact OK: master=120
+```
+
+- **The exposure limit is 1170 minutes (19.5 h).** The poll at `70,164,368` did not trip and
+  the poll at `70,224,368` did, so the limit is in `(70164368, 70224368]` ms. The only whole
+  minute in that window is 1170, which matches the `SAFE_VOLUME_TIME_LIMIT_MINUTES` name.
+  Round-hour values 12 h through 19 h were each excluded by watching the counter pass them.
+- **Restore latency: 46 ms** from `requestSafeVolumeConfirm` to the level being written, 85 ms
+  to the verified read-back. Consistent with the README's 44–70 ms from v1.3.1.
+- `panelStatus=2` (STATUS_SAFE_VOLUME) on the first restore while `nowIzm=120` — the panel
+  rejected the write and the Izm path took it anyway. This is why restore goes through Izm
+  `setVolume` rather than the panel.
+- **The player stops on the clamp.** Playback was running before the trip and the next idle
+  check reported `nothing playing`. Anything relying on playback continuing across a trip has
+  to account for that.
+- **With the screen off the dialog never becomes foreground**, so `tryClickOk` exhausts its
+  polls and logs `alert never became foreground`. The activity stays in the back stack —
+  `visible=true visibleRequested=false`, `launchedFromPackage=com.sony.walkman.volumectrlpanel`
+  — and surfaces on the next wake, where VolGuard picks it up as `trip via dialog` and
+  dismisses it (`OK clicked`, `alert dismissed`) about 3.2 s later. So a screen-off trip costs
+  the user one dialog on their next wake, already accepted and self-dismissing.
 
 ## The dialog cannot wake the screen
 
@@ -94,19 +138,66 @@ invisible, so an overlay to hide it buys very little. A stale `VolumeCtrlAlert`
 activity can sit in the back stack and surface on the next wake — which is what
 `am start`-based testing leaves behind.
 
-## Detecting playback: do not use isMusicActive()
+## Detecting playback: no single platform API works
 
-`AudioManager.isMusicActive()` is unusable on this device. Sony's offload output leaves the
-music stream reported active indefinitely after the player is released — verified on device,
-where it still returned `true` more than ten minutes after the last track ended and every
-player had dropped out of `dumpsys audio`.
+Both obvious answers are wrong on this device, and they are wrong in opposite directions.
+Getting this right needs all three sources below.
 
-The failure mode is nasty: idle suppression works perfectly from a cold start, then stops
-arming forever the moment a single track has played, with nothing in the log to explain it.
+### Sony's music is invisible to `getActivePlaybackConfigurations()`
 
-Use `AudioManager.getActivePlaybackConfigurations()` instead, filtered by
-`AudioAttributes.getUsage()` so a notification blip does not count as listening. Released
-players really do drop out of that list.
+This is what 1.5.0 shipped, and it dropped the volume mid-song. Sampled simultaneously
+while a track was audibly playing:
+
+| Source | Says |
+|---|---|
+| `dumpsys media_session` | `com.sony.walkman.highresmediaplayer` → `state=PLAYING(3)` |
+| `dumpsys media.audio_flinger` | offload thread `AudioOut_135`, `1 Tracks of which 1 are active`, client pid 2395, `Usg=1` |
+| `dumpsys audio` → `players:` | **nothing** — two idle `SoundPool` entries |
+
+The audio runs on a native offload AudioTrack that is never registered with the platform's
+`PlaybackActivityMonitor`, so it never enters the player list. What *does* enter the list is
+a ~1 second `android.media.AudioTrack` that Sony's player creates at playback start and at
+every track change, then releases.
+
+That blip is why the API looks correct under test: a player really does appear the instant
+you press play — this is what 1.5.0's "restore 3–6 ms after the audio track starts"
+measured — and then vanishes while the song continues. Thirty seconds after the screen goes
+off, suppression fires on top of live audio.
+
+**The blip is a valid trigger and an invalid state.** Use `onPlaybackConfigChanged` to mean
+"re-evaluate now"; never read an empty player list as silence.
+
+### `isMusicActive()` never misses audio, but lags
+
+`AudioManager.isMusicActive()` sees the offload track, so it has no false negatives. It was
+observed still returning `true` more than ten minutes after playback ended, which makes it
+useless as a positive signal — as a sole source it works from a cold start and then never
+arms again. It is sound as a veto only.
+
+(Measured later: pausing tears the `AudioOut_135` thread down entirely, so the stickiness
+may be narrower than that first observation suggested. Not worth relying on either way.)
+
+### The MediaSession is the only source that distinguishes playing from paused
+
+Verified on device: `PLAYING(3)` while playing, `PAUSED(2)` immediately on pause, `position`
+advancing. Reading it requires `MediaSessionManager.getActiveSessions()`, which accepts only
+callers holding `MEDIA_CONTENT_CONTROL` (signature|privileged — unavailable to a sideloaded
+app) or an **enabled notification listener**. Hence `VolGuardNotificationListener`, which
+exists purely as the `ComponentName` token and handles no notifications.
+
+`com.sony.songpal.localplayer.playbackservice.playstatechanged` is not an alternative: it is
+sent with an explicit `cmp=` targeting Sony's own widgets, so no third party can receive it.
+
+### What VolGuard does
+
+```
+configs say playing            -> playing        (catches other apps, and Sony's start blip)
+else session available         -> trust it       (the only play/pause authority)
+else                           -> isMusicActive() (conservative veto; may never arm)
+```
+
+An **empty session list is "unavailable", not "idle"**. A player that drops its session while
+its audio track keeps writing would otherwise read as silence — the same mistake, one layer up.
 
 Related: do not cache screen state from `ACTION_SCREEN_ON`/`OFF` alone. A missed edge leaves
 the cached flag stale and suppression never arms again. Read `PowerManager.isInteractive()` at
@@ -127,4 +218,28 @@ what turns a transient condition into a permanent one.
   it nothing beyond the buffer header, even though the identical `logcat` invocation
   works from `adb shell`.
 - `adb shell input keyevent 24/25` does not drive the Izm master, so the volume cannot
-  be swept from adb — only a bound client can set it.
+  be swept from adb — only a bound client can set it. Raising the level for a test is
+  therefore a manual step on the device. Note that a hardware volume change does not
+  produce a `SafeVolume: setVolume:` line the way a binder write does; `timer start.` is
+  the only confirmation that the level went above the threshold.
+
+### Silent exposure rig
+
+`isTimerConditionActive()` never checks playback, so the budget can be burned at full rate
+with **nothing playing and no sound at all**: headphones plugged in but off the ears, master
+raised above the threshold, screen kept awake (`adb shell svc power stayon true`) so idle
+suppression never arms. This is the only way to reach a genuine trip without hours of loud
+listening, and it carries no hearing risk until the clamp itself fires.
+
+Measured with that rig on the NW-A306:
+
+- The polling timer ticks **once per 60 s**, logging `count up: <total ms>`; each tick adds
+  ~60,000 ms. The value is the cumulative total, not a delta.
+- **The timer does not run at master 71.** No `timer start.` or `count up:` appears anywhere
+  at that level with headphones connected, and the timer arms the moment the level is
+  raised. So the threshold on this unit/output is above 71 — meaning at 71 the budget never
+  burns, the dialog can never fire, and idle suppression buys nothing. It is insurance for
+  listening above the threshold, not a general saving. Worth knowing before attributing any
+  value to it.
+- Restore `svc power stayon` and drop the master back to a normal level afterwards. A rig
+  left at maximum is a real hazard the next time the headphones go on.
