@@ -378,6 +378,8 @@ public class VolGuardService extends AccessibilityService {
             // silence in the log. Only real transitions are events.
             if (playing == lastSessionPlaying) return;
             lastSessionPlaying = playing;
+            // Sony's alert has just killed playback mid-trip. Put it straight back.
+            if (!playing && alertActive) resumePlayback();
             if (playing) endSuppression("playback started", true);
             scheduleIdleCheck();
         }
@@ -564,6 +566,38 @@ public class VolGuardService extends AccessibilityService {
             } catch (Exception ignore) { }
         }
         return null;
+    }
+
+    /**
+     * Put playback back after Sony's alert stopped it.
+     *
+     * VolumeCtrlAlertActivity requests AUDIOFOCUS_GAIN when it launches, so the player is
+     * handed AUDIOFOCUS_LOSS and stops without resuming. Measured on device: a play issued
+     * while the alert still holds focus makes the player reclaim focus and continue, and
+     * the alert — being a dialog — is unaffected by losing it.
+     *
+     * Fires once, immediately, and only from the stop event. There is deliberately no
+     * retry: either this is fast enough to go unnoticed, or playback has visibly stopped
+     * and the user reaches for the button, in which case a late automatic play would
+     * collide with their press and pause the track instead.
+     */
+    private void resumePlayback() {
+        String pkg = resumePkg;
+        resumePkg = null;
+        if (pkg == null) return;
+        for (android.media.session.MediaController c : watchedControllers) {
+            try {
+                if (!pkg.equals(c.getPackageName())) continue;
+                if (isPlayingState(c.getPlaybackState())) return;
+                c.getTransportControls().play();
+                Log.i(TAG, "resumed playback for " + pkg);
+                return;
+            } catch (Exception e) {
+                Log.w(TAG, "resume playback failed for " + pkg, e);
+                return;
+            }
+        }
+        Log.w(TAG, "resume playback: no controller for " + pkg);
     }
 
     private ComponentName listenerComponent() {
