@@ -310,7 +310,17 @@ button press and pause the track instead."
 
 ---
 
-### Task 3: Document and release
+### Task 3: Document and release — SUPERSEDED, do not execute
+
+> Shipped as 1.7.0 instead, with different numbers and one extra fix. Do not run the steps
+> below: they contain `REPLACE_WITH_MEASURED_MS` placeholders and assume a resume gap of "tens
+> of milliseconds", which the device measurement disproved — it is 350–1210 ms, set by Sony's
+> player and not improvable from the trigger side. Task 2's premise that the stop event is the
+> only workable trigger also turned out to be incomplete: on the dialog path the stop arrives
+> before VolGuard knows a trip is under way, so the resume has to fire from `beginTrip`.
+>
+> What actually happened is in `docs/safe-volume-mechanism.md` ("How fast playback can be
+> resumed") and in commits `bc94f57` and `c9feabf`. Kept for the record only.
 
 **Files:**
 - Modify: `docs/safe-volume-mechanism.md` (the "A real trip, measured" section)

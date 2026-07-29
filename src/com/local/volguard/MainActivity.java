@@ -39,6 +39,8 @@ public class MainActivity extends Activity {
                 + "and restores Walkman master volume to your pre-clamp level.\n\n"
                 + "It accepts the safe-volume gate immediately, restores volume via "
                 + "Sony's volume service, then taps OK once the button appears.\n\n"
+                + "The dialog also takes audio focus and stops the music, so VolGuard "
+                + "starts playback again — usually within about a second.\n\n"
                 + "If it ever stops working, enable VolGuard below under Accessibility.");
         root.addView(tv);
 

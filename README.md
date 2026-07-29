@@ -8,7 +8,7 @@ listening, and cleans it up when it does fire — accepting the safety gate, res
 **Walkman master volume** (0–120) to the level you had before the drop, and dismissing
 the dialog. **No root.**
 
-Latest: [v1.6.0](../../releases/tag/v1.6.0)
+Latest: [v1.7.0](../../releases/tag/v1.7.0)
 
 ## Disclaimer
 
@@ -39,6 +39,10 @@ time would suggest.
   starts. Nothing is audible, because it only ever happens during silence.
 - Restores the **exact** pre-drop master level when a warning does fire (if you were
   at 120, you get 120)
+- **Starts the music again.** Sony’s dialog takes audio focus, which stops playback
+  for good — a warning used to leave you with the right volume and silence. VolGuard
+  presses play for you. It takes about a second, and that second is Sony’s: its player
+  refuses a play command until it has finished stopping.
 - Accepts Sony’s safe-volume gate so that restore can stick
 - Taps OK for you once Sony enables the button, so the dialog leaves cleanly
 - Does **not** stop the warning forever — it makes it much rarer, and handles it
@@ -50,6 +54,7 @@ time would suggest.
 |--|--|
 | Warnings | Much rarer, because idle time no longer costs budget |
 | Volume back | Typically tens of milliseconds after the clamp (see [Timing](#timing-nw-a306)) |
+| Music after a warning | Restarts by itself, typically ~0.4–1.2 s |
 | Dialog | Still appears; fully gone after ~3.5 s (Sony’s OK delay) |
 | Hands-free | Yes, once accessibility is enabled |
 | Volume while listening | Never touched — suppression only runs with nothing playing |
@@ -150,6 +155,7 @@ Device: NW-A306.
 
 | Metric | Result | Measured on |
 |--------|--------|-------------|
+| Playback resumed after a warning | **~0.4–1.2 s** (Sony’s floor, not ours) | v1.7.0 |
 | Idle restore, playback start → level written | **44 ms** | v1.6.0 |
 | Volume restored to pre-clamp level, **real trip** | **46 ms** | v1.6.0 |
 | Volume restored to pre-clamp level | **~44–70 ms** | v1.3.1 |
@@ -170,6 +176,10 @@ Interpretation:
   `onResume`. Skipping that without a real OK risks `AVC_NON_CHECK_LEVEL_OK` and a
   re-launch.
 - By the time you notice the dialog, volume should already be correct.
+- The resume is the one slow number here, and none of it is VolGuard’s: Sony’s player
+  ignores a play command until it has finished handling the focus loss, which takes it
+  350–1210 ms. VolGuard adds ~50 ms on top. Measured, with the alternatives ruled out,
+  in [docs/safe-volume-mechanism.md](docs/safe-volume-mechanism.md).
 
 Other units and outputs may differ; treat these as an A306 reference, not a
 guarantee.
